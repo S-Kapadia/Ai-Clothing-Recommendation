@@ -1,0 +1,2 @@
+-- Database schema for AI-powered marketing recommendation plugin
+-- TODO: define tables, indexes, and constraints
