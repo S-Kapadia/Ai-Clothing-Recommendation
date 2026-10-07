@@ -1,0 +1,3 @@
+-- 001_init.sql
+-- TODO: define the initial schema here (e.g. advertisers/merchants, offers, recommendation_events).
+-- Write CREATE TABLE statements below, then run `npm run migrate` from the db/ directory.
