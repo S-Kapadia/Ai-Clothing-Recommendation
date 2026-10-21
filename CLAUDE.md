@@ -1,6 +1,6 @@
 # Ai-Clothing-Recommendation
 
-Fit-aware semantic search across Shopify apparel brands.
+Fit-aware, personalized semantic search across Shopify apparel brands.
 Spec: docs/SPEC.md. Architecture: docs/HLD.md. Plan: docs/PLAN.md. Work one phase at a time.
 
 ## Environment
@@ -18,6 +18,8 @@ Spec: docs/SPEC.md. Architecture: docs/HLD.md. Plan: docs/PLAN.md. Work one phas
 - Cache every LLM call to disk, keyed by model + prompt version + input hash. Never re-call for cached inputs.
 - Every LLM extraction must use a JSON schema; save raw outputs to extraction_runs.
 - Every reported metric comes from a script writing results/metrics.csv. No numbers from notebooks.
-- Never generate, edit, or fill in gold-set, closet, classifier spot-check, or query labels. Those are mine.
+- Never generate, edit, or fill in gold-set, closet, classifier spot-check, query, or personalization-session labels. Those are mine.
 - No LLM calls and no PyTorch in serving/. The server uses onnxruntime + NumPy only.
+- No server-side storage of shopper data: height, weight, query text, clicks, ratings and style profiles are never written to the database, request log, or disk. Style profiles are built per request from the `liked` field and discarded.
+- Shopper history lives only in browser local storage on the demo page.
 - Each phase ends with its "done when" check from docs/PLAN.md passing, then a commit.
