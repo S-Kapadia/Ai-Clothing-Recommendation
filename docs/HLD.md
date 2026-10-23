@@ -2,13 +2,13 @@
 
 Oct 21, 2026 · @Samay Kapdia
 
-**Status:** planning draft v0.3 (style personalization added; matches SPEC v1.1). This HLD feeds `docs/SPEC.md` and Claude Code plan mode, which will decide file-level details. Anything marked *(provisional)* is expected to change.
+**Status:** planning draft v0.4 (portable fit profile added; matches SPEC v1.2). This HLD feeds `docs/SPEC.md` and Claude Code plan mode, which will decide file-level details. Anything marked *(provisional)* is expected to change.
 
 **How to read it:** every section opens with an *In plain words* summary for non-technical readers, followed by the technical detail.
 
 ## 1. Executive Summary & Core Objectives
 
-*In plain words:* a size label like "Medium" means something different at every clothing brand. Ai-Clothing-Recommendation reads each brand's size chart, converts every size into real measurements in centimetres, and lets a shopper search across stores. Results are ranked by how well they match the search, how likely each size is to fit that shopper, and how close each item is to styles the shopper has liked before, with a one-line reason such as "Get the L; the M will be short."
+*In plain words:* a size label like "Medium" means something different at every clothing brand. Ai-Clothing-Recommendation reads each brand's size chart, converts every size into real measurements in centimetres, and lets a shopper search across stores. Results are ranked by how well they match the search, how likely each size is to fit that shopper, and how close each item is to styles the shopper has liked before, with a one-line reason such as "Get the L; the M will be short." Shoppers can also log garments they already own as a fit reference, and paste a product link to get sized against the catalog directly.
 
 **Origin:** Every brand sizes differently, so buying from a new store is a guess.
 
@@ -28,8 +28,9 @@ Oct 21, 2026 · @Samay Kapdia
 4. Raise the mean 1 to 5 rating of the top 5 results through style personalization, measured on my own sessions against the same ranking without personalization.
 5. Run at near-zero cost: local quantized open models for all LLM work, free hosting for the demo.
 6. Ship a one-page demo anyone can try in under a minute.
+7. Show that a few self-reported purchases correct the body estimate better than height and weight alone, measured by leave-one-out on the closet set.
 
-**Non-goals for v1:** user accounts (a stretch goal), storing anything about shoppers on the server, women's fit predictions (every product is tagged men / women / unisex, but v1 searches men's + unisex only; women's fit is a stretch goal), image-based search (text-only in v1), outerwear and footwear, virtual try-on, live catalog refreshes, real-user traffic.
+**Non-goals for v1:** user accounts (a stretch goal), storing anything about shoppers on the server, women's fit predictions (every product is tagged men / women / unisex, but v1 searches men's + unisex only; women's fit is a stretch goal), image-based search (text-only in v1), outerwear and footwear, virtual try-on, live catalog refreshes, real-user traffic, checking links for products outside the crawled catalog (live-fetch check-a-link is a stretch goal).
 
 ## 2. High-Level Architecture Diagram
 
@@ -59,16 +60,20 @@ flowchart TB
     IDX --> BUN
   end
   subgraph ON["Online service - free host"]
-    LS[("Browser storage<br/>clicks + 1-5 ratings")] <--> UI["C13 Demo page"]
+    LS[("Browser storage<br/>clicks + ratings + purchases")] <--> UI["C13 Demo page"]
     UI -->|POST /search, JSON over HTTPS| API["C12 Search API"]
-    API --> PROF["Profile builder"]
-    API --> STY["Style profile builder<br/>from liked items"]
+    UI -->|POST /check-link, JSON over HTTPS| API
+    API --> RES["C15 URL resolver<br/>check-link only"]
+    API --> PROF["Profile builder<br/>height+weight blended with purchases"]
+    API --> STY["Style profile builder<br/>from liked items + purchase verdicts"]
     PROF --> L1["L1 retrieval<br/>embed + fit filter"]
+    RES --> L1
     L1 --> L2["L2 ranking<br/>fit + relevance + style"]
     STY --> L2
     L2 --> EXP["Explainer"]
+    RES --> EXP
     EXP -->|results JSON| UI
-    API --> LOG[("Request log<br/>timings only")]
+    API --> LOG[("Request log<br/>timings + endpoint only")]
   end
   BUN -->|loaded at startup| API
 ```
@@ -99,15 +104,16 @@ The dotted line marks the only place an LLM is used: offline, on my PC. The LLM 
 
 | # | Component | What it does |
 | --- | --- | --- |
-| C12 | Search API | Receives a search, runs the steps below, returns results. Also a health check |
-| C12a | Profile builder | Turns height and weight (and later, a reference garment) into the shopper's estimated measurements |
-| C12b | **L1 retrieval (Pillar 2, serving half)** | Embeds the search text, pulls about 200 matching products from the index, then drops products in the wrong category or department and any with no size that could fit |
+| C12 | Search API | Receives a search or a check-a-link request, runs the steps below, returns results. Also a health check |
+| C12a | Profile builder | Turns height and weight into the shopper's estimated measurements, blended per dimension with purchase-implied measurements when purchases cover that dimension (weight n/(n+k) toward the purchases, n = purchases informing that dimension, k in config) |
+| C12b | **L1 retrieval (Pillar 2, serving half)** | Embeds the search text (or, for check-a-link, reuses the linked product's own embedding), pulls about 200 matching products from the index, then drops products in the wrong category or department and any with no size that could fit |
 | C12c | **L2 ranking (Pillar 3, serving half)** | Scores each remaining item's sizes for fit, picks the best size, combines fit, relevance and style similarity, sorts |
 | C12d | Explainer | Writes the one-line reason from the measurement differences, using templates (no LLM on the server) |
-| C12e | Request logger | Records each search's step timings and result count only |
-| C12f | **Style profile builder** | Turns the clicks and 1 to 5 ratings sent with the search into a style profile: a weighted average of those products' embeddings (high ratings pull toward, low ratings push away, plain clicks count a little). Built per request and discarded afterwards; needs at least 3 signals |
-| C13 | Demo page | A single static web page: height, weight, a Men / Women toggle (Women shows "coming soon" in v1) and a search box in; result cards with photo, size, fit bars, reason and a link to the store out. After a click, a 1 to 5 rating prompt appears on the card. Clicks and ratings are kept in browser storage, with "clear my history" and "export my history" buttons |
+| C12e | Request logger | Records each request's endpoint, step timings and result count only |
+| C12f | **Style profile builder** | Turns the clicks, 1 to 5 ratings and purchase verdicts sent with the request into a style profile: a weighted average of those products' embeddings (high ratings and "wear" pull toward, low ratings and "don't wear" push away, plain clicks count a little). Built per request and discarded afterwards; needs at least 3 signals |
+| C13 | Demo page | A single static web page: height, weight, a Men / Women toggle (Women shows "coming soon" in v1) and a search box in; result cards with photo, size, fit bars, reason and a link to the store out. After a click, a 1 to 5 rating prompt appears on the card. Clicks, ratings and purchases are kept in browser storage, with "clear my history", "export my history", "my purchases" and "check a link" controls |
 | C14 | LLM re-ranker (local only) | An extra L2 step using a local LLM. Runs in evaluation and in local mode, not on the deployed server |
+| C15 | **URL resolver (check-a-link only)** | Matches a pasted product URL to a catalog product by store domain and product handle; returns a `not_in_catalog` or `department_unsupported` status when there's no usable match, otherwise hands the product's own embedding to L1 as the retrieval query and its measurements to L2 for direct fit scoring |
 
 ## 4. Data Flow & End-to-End Request Lifecycles
 
@@ -147,7 +153,7 @@ Example: a 188 cm, 72 kg shopper who has rated a few slim-fit items highly searc
            {"product_id": "456", "signal": "click"}]}
 ```
 
-2. **Profile.** The body estimator turns height and weight into estimated waist, hip and inseam (C12a).
+2. **Profile.** The body estimator turns height and weight into estimated waist, hip and inseam, blended per dimension with any purchase-implied measurements (C12a).
 3. **Style profile.** If at least 3 signals were sent, the liked products' embeddings are combined into a style profile (C12f). Unknown product IDs are ignored; the list is capped at 50.
 4. **L1 retrieval.** The query becomes an embedding; the index returns about 200 similar products. Products in the wrong category or department, or with no size inside fit tolerance, are dropped (C12b).
 5. **L2 ranking.** For each remaining product, every size is scored for fit and the best size is kept. Relevance, fit and style similarity combine into one score; style counts for nothing when there's no profile. Results are sorted (C12c).
@@ -167,6 +173,22 @@ Example: a 188 cm, 72 kg shopper who has rated a few slim-fit items highly searc
 2. Check `results/metrics.csv` against the previous version; ship only if nothing got worse.
 3. Build the server image with the new artifact bundle and deploy. The demo page shows the catalog's snapshot date.
 
+### Lifecycle F: check a link (online, about 1 second)
+
+Example: the same 188 cm, 72 kg shopper pastes a product URL from a store in the catalog.
+
+1. **Request.** The demo page sends JSON over HTTPS to `POST /check-link`, including the URL and the same profile fields as `/search` (height, weight, purchases, liked):
+
+```json
+{"url": "https://store.example.com/products/slim-chino", "height_cm": 188, "weight_kg": 72}
+```
+
+2. **Resolve.** The URL resolver (C15) matches the store domain and product handle against the catalog. No match → respond `{"status": "not_in_catalog", ...}`; a match in an unsupported department (women's) → `{"status": "department_unsupported", ...}`. Both are plain 200 responses, not errors.
+3. **Profile.** Height, weight and any purchases are blended into a body estimate exactly as in Lifecycle C (C12a).
+4. **Fit the linked product.** Its sizes are scored directly against the body estimate (C12c); the best size, its fit probability and fit word per measurement are kept, even if the fit isn't great — the shopper already has this product in mind, so it isn't filtered out the way `/search` filters non-fitting items.
+5. **Find better alternatives.** The linked product's own embedding becomes the L1 query (C12b); results are filtered by category, department and fit tolerance as usual, then kept only if `fit_probability` is at least a margin above the linked product's own best-size `fit_probability` (margin in config, starting 0.05), then ranked by the normal L2 score (C12c) and capped at 5.
+6. **Respond and log.** Return the linked product's size/fit/reason plus the similar items; log step timings, result count and the `check-link` endpoint only (C12e).
+
 ## 5. Data Storage & Schema Strategy
 
 *In plain words:* data lives in four places. **Raw downloads** stay as files on my PC so any step can be re-run without hitting stores again. The **cleaned catalog and labels** live in a Postgres database (Supabase) so they can be queried and checked. The **server package** is a set of files loaded into memory, so searches never wait on a database. The **shopper's clicks and ratings** stay in their own browser.
@@ -181,7 +203,7 @@ Example: a 188 cm, 72 kg shopper who has rated a few slim-fit items highly searc
 | Evaluation results | Repo, `results/metrics.csv` | CSV | Kilobytes |
 | Server package | `artifacts/vN/`, copied into the server image | Index file, number arrays, model files, ID map | Under 300 MB |
 | Request log | Supabase Postgres | Table | Small |
-| Shopper height, weight, clicks and ratings | The shopper's browser (local storage) only | JSON | Kilobytes |
+| Shopper height, weight, clicks, ratings, purchases and check-a-link URLs | The shopper's browser (local storage) only | JSON | Kilobytes |
 
 **No separate cache layer.** Every product's measurements and embeddings fit in server memory, so in-memory lookups replace a cache like Redis. Cost optimization: this removes a whole service.
 
@@ -204,11 +226,11 @@ Each measurement is one row: (chart, size, dimension, value in cm). Adding outer
 | `extraction_runs` | Every LLM extraction and review | chart, model name, prompt version, raw output, latency |
 | `gold_labels` | Hand-labelled chart measurements | chart, size label, dimension, value in cm |
 | `closet_items` | Real garments with fit outcomes | owner alias, owner height and weight, category, garment measurements, fit word per dimension (five-word scale), overall verdict |
-| `request_log` | Server searches | timestamp, step timings, result count |
+| `request_log` | Server searches and check-link calls | timestamp, endpoint, step timings, result count |
 
-There is deliberately no table for shopper clicks, ratings or profiles.
+There is deliberately no table for shopper clicks, ratings, purchases or profiles.
 
-**Privacy:** the request log stores timings and counts only, never height, weight, search text, clicks or ratings. Style profiles exist only for the duration of one request. Closet owners appear under aliases.
+**Privacy:** the request log stores timings, endpoint and counts only, never height, weight, search text, URLs, purchases, clicks or ratings. Style and purchase-correction profiles exist only for the duration of one request. Closet owners appear under aliases.
 
 **Embedding IDs:** each index row maps to a product ID through the ID map in the artifact bundle. Images are never stored, only their links.
 
@@ -220,7 +242,7 @@ There is deliberately no table for shopper clicks, ratings or profiles.
 
 | Area | Requirement | How it's met |
 | --- | --- | --- |
-| Search speed | Typical search under 2 s once the server is awake | All data in memory; no database or LLM calls during a search; style profile is a small vector average |
+| Search speed | Typical search or check-a-link under 2 s once the server is awake | All data in memory; no database or LLM calls during a search; style and purchase-correction profiles are small vector/scalar averages |
 | Cold start | Up to 60 s after idle is acceptable | Demo page shows a "warming up" message |
 | Offline run time | Full pipeline fits in one overnight run on my PC | Chart deduplication; LLM only for charts the rules can't parse; GPU for models |
 | Cost | $0 for LLM work, $0 to a few dollars a month for hosting | Local quantized models; free hosting and database tiers |
@@ -253,6 +275,8 @@ There is deliberately no table for shopper clicks, ratings or profiles.
 | History in the browser, no accounts | No login; nothing personal on the server; server stays stateless | History doesn't follow you across devices | Accounts become worthwhile (stretch goal 7) |
 | Clicks plus explicit 1 to 5 ratings | Ratings verify whether clicks mean "liked" | Asks the shopper for a little effort | Click-to-rating agreement is high enough to drop the prompt |
 | Personalization evaluated on one user (me) | Honest, real ratings | Shows it works for me, not that it generalizes | Friends or real users can run the same sessions |
+| Blended purchase correction, not an override | Robust to one noisy or mismeasured purchase; simple weighted average, no training | Under-corrects a shopper with a consistently unusual build (my own case) until purchases accumulate or k is tuned down | Closet leave-one-out shows a pure per-dimension override would do meaningfully better |
+| Check-a-link limited to catalog stores in v1 | No live fetch, no new failure surface, reuses existing embeddings and fit data | Useless for the vast majority of the web | The live-fetch stretch item ships |
 
 **Cost and complexity optimizations already taken:** rules before LLMs; one LLM call per unique chart, not per product; no cache service; no message queue; no scheduled jobs; static demo page; personalization reuses the existing search embeddings instead of a new model or user database.
 
@@ -279,6 +303,8 @@ There is deliberately no table for shopper clicks, ratings or profiles.
 | Oversized or malformed history in a request | Slow or broken search | Request validation | `liked` capped at 50; unknown product IDs ignored |
 | Server runs an old artifact version | Results don't match the README | Health endpoint reports artifact version | Deploy step checks the version |
 | Free database pauses after inactivity | Request logging fails | Logger error count | Logging failures never break a search |
+| Product URL's store or handle changed since the snapshot | check-link reports `not_in_catalog` for a product that's actually in the catalog under a different handle | Resolver requires an exact domain + handle match | Returned as `not_in_catalog`, not a wrong match; a re-crawl refreshes handles |
+| A purchase's fit word contradicts height and weight | Body estimate could swing toward a mismeasured or mislabelled purchase | Blend (not override) dampens any single purchase's effect; multiple purchases average out noise | Weight capped by k; closet leave-one-out reports accuracy across k values |
 
 ## 8. Technology Stack Recommendations & Rationale
 
@@ -329,12 +355,22 @@ There is deliberately no table for shopper clicks, ratings or profiles.
 | Rating scale | 1 to 5, asked only after a click |
 | Project name | Ai-Clothing-Recommendation |
 
+**Resolved on Oct 22**
+
+| Question | Decision |
+| --- | --- |
+| Purchase correction mechanism | Blended per dimension: weight n/(n+k) toward the purchase-implied measurement, height + weight alone at n = 0; k lives in config, reported for {0.5, 1, 2} |
+| Check-link not-found / unsupported | A plain HTTP 200 with a `status` field, never an error |
+| Purchase verdict → style weights | `wear` = +1.0, `wear_but_flawed` = 0, `dont_wear` = -1.0 (starting values) |
+| "Fits better" threshold | `fit_probability` at least a margin (config, starting 0.05) above the linked product's own |
+
 **Still open**
 
 1. **Which stores?** Shortlist 30 to 40 Canadian and US Shopify apparel brands, ideally a mix known to run long, slim, short and wide; vetting keeps 15 to 20.
 2. **Initial ease values** per category and dimension, sanity-checked against the closet set.
 3. **L2 weights:** relevance vs fit tuned on the query set; style weight and signal weights set from the personalization sessions.
 4. **Final host** after checking current free-tier limits.
+5. **Purchase-correction k and check-link margin:** starting values k = 1, margin = 0.05; sanity-checked against the closet leave-one-out metric in Phase 6.6 rather than picked blindly.
 
 ### Next steps
 
@@ -344,3 +380,4 @@ There is deliberately no table for shopper clicks, ratings or profiles.
 - [ ] Convert and rename the old repo to `ai-clothing-recommendation`; check its history for secrets
 - [ ] Add `docs/SPEC.md`, `docs/HLD.md` and `CLAUDE.md`, then run plan mode to produce `docs/PLAN.md`
 - [ ] After Phase 6: run personalization sessions (10 fixed queries before, 20 or more ratings, same queries after) and export history
+- [ ] After Phase 6.5: run Phase 6.6 (purchases + check-a-link) and report the closet leave-one-out sensitivity across k

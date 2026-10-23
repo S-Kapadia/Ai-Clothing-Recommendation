@@ -1,4 +1,4 @@
-# Ai-Clothing-Recommendation: PLAN v1.0
+# Ai-Clothing-Recommendation: PLAN v1.1
 
 Scope and acceptance criteria: `docs/SPEC.md`. Architecture: `docs/HLD.md`. This file is the phase-by-phase build checklist — work one phase at a time (CLAUDE.md), tick a box, commit, move on.
 
@@ -9,6 +9,9 @@ Scope and acceptance criteria: `docs/SPEC.md`. Architecture: `docs/HLD.md`. This
 3. **No integration hooks for women's fit in this repo.** Phase 3's fit model stays hardcoded to the male ANSUR subset, men+unisex, per SPEC. No department-pluggable abstraction is added speculatively — merging your partner's model later is unplanned future work.
 4. **Image-only size charts** auto-abstain in v1 (no vision-LLM call) — stretch goal #6 stays out of scope.
 5. **Demo-page JS tests:** a couple of `node:test` unit tests for the pure history-logic functions (cap-at-50, clear, export shape) plus a manual in-browser QA checklist. No Playwright infra for a single static page.
+6. **Purchase correction is blended, not an override.** Per dimension, the body estimate is `n/(n+k) * purchase_implied + k/(n+k) * height_weight_estimate`, where n = purchases informing that dimension; height + weight alone at n = 0. k lives in `config/ranking.yaml`, starting 1; Phase 6.6 reports the closet leave-one-out accuracy for k in {0.5, 1, 2} since the closet set is too small to trust a single tuned value.
+7. **Check-link and purchase lookups never 4xx on an expected miss.** Not-in-catalog and department-unsupported are both ordinary HTTP 200 responses with a `status` field — consistent with how `/search` already handles `department=women`.
+8. **"Fits better" is a margin, not just "higher."** A check-link similar item must beat the linked product's own best-size `fit_probability` by at least a margin (config, starting 0.05), not merely tie or edge it out — avoids surfacing near-identical alternatives as if they were meaningfully better.
 
 ---
 
@@ -221,7 +224,45 @@ Scope and acceptance criteria: `docs/SPEC.md`. Architecture: `docs/HLD.md`. This
 
 ---
 
-## Phase 7 — Nov 2: README, buffer
+## Phase 6.6 — Nov 2–3: portable fit profile (purchases + check a link)
+
+**Goal:** self-reported purchases correct the body estimate (blended with height/weight, never a full override — decision 6) and double as a style signal; a pasted product URL from a catalog store gets sized directly and compared against better-fitting alternatives.
+
+**Files/modules:**
+- `serving/api/purchases.py` (parse `purchases`, build the per-dimension blended estimate, map verdicts to style-signal weights)
+- `serving/api/check_link.py` (URL → domain + handle resolution, `not_in_catalog`/`department_unsupported` responses, similar-items selection)
+- `models/fit/invert.py` (pure function: garment measurement + ease + fit word → implied body measurement; the inverse of the existing fit-word thresholds; shared by `purchases.py` and `eval/phase6_6_purchases.py`)
+- Modify `serving/api/profile.py` (blend purchase-implied measurements into the height/weight estimate, C12a)
+- Modify `serving/api/style.py` (fold purchase verdicts into the existing style-profile weighted sum, C12f)
+- Modify `serving/api/schemas.py` (`Purchase`, `CheckLinkRequest`, `CheckLinkResponse` models)
+- Modify `serving/api/main.py` (register `POST /check-link`)
+- Modify `serving/api/logging.py` (add `endpoint` to the `request_log` insert)
+- `serving/demo/purchases.js` (add/remove/list purchases, capped at 30, local-storage backed)
+- `serving/demo/checklink.js` (URL box, renders the `/check-link` response or its `status` message)
+- `eval/phase6_6_purchases.py` (closet leave-one-out, k in {0.5, 1, 2})
+- `eval/phase6_6_checklink.py` (the four endpoint test cases + latency)
+
+**Supabase migrations:**
+- `0006_request_log_endpoint.sql` — add a nullable `endpoint` column to `request_log` (still timings/result-count only, never a URL or query).
+
+**Config files:**
+- `config/ranking.yaml` additions: `purchase_correction_k` (starting 1), `check_link_fit_margin` (starting 0.05), purchase verdict → style-signal weights (`wear: 1.0, wear_but_flawed: 0.0, dont_wear: -1.0`).
+
+**Tests / done when:**
+- [ ] unit tests for `models/fit/invert.py` (a garment measurement + fit word round-trips to the same fit word when re-scored by the existing fit model).
+- [ ] unit tests for the blend (n=0 falls back to height/weight exactly; n=1 is a 50/50 average at k=1; n=2 is 2:1; unknown purchase product IDs are ignored and don't count toward n).
+- [ ] unit tests for the style-signal mapping (wear/wear_but_flawed/dont_wear weights; purchases and `liked` combine toward the same 3-signal minimum).
+- [ ] unit tests for the URL resolver's four cases: crawled product URL (match), unknown store, unknown product on a known store, known product in an unsupported department — all HTTP 200.
+- [ ] unit test asserting `check_link.py`'s similar-items filter requires `fit_probability >= linked_fit_probability + margin` and excludes the linked product itself.
+- [ ] **Metric reported:** `python -m eval.run_all --phase 6.6` writes, to `results/metrics.csv`: per-dimension purchases-blended-vs-height/weight-only leave-one-out accuracy with confidence intervals for k in {0.5, 1, 2} (noting the closet set is small), and check-link end-to-end latency (p50/p95) from `request_log`.
+
+**Manual tasks (SPEC §13):** enter my own purchases on the demo page (Nov 2–3) — informal QA; the leave-one-out metric reuses the existing closet labels, no new labelling.
+
+**Risks / fallback:** a 2-day window right after Phase 6.5's own tight window → SPEC's fallback order applies: cut the query set to 30 first, then move Phase 6.6 to stretch, then Phase 6.5, with Phases 0–6 unaffected.
+
+---
+
+## Phase 7 — Nov 4: README, buffer
 
 **Goal:** publish the results and architecture; buffer for overflow.
 
@@ -356,12 +397,31 @@ python-dotenv==1.0.1
 
 **Demo page:** `localStorage["acr_history_v1"] = {clicks: [{product_id, ts}], ratings: [{product_id, value, ts}]}`. On each search, the most-recent 50 entries (clicks + ratings combined, sorted by `ts` desc) are mapped into the `liked` request shape. "Clear my history" wipes the key. "Export my history" downloads the **full** stored history (not just the capped 50) as `acr_history_<timestamp>.json`; this exact shape is what `eval/personalization/session_schema.py` parses for the Phase 6.5 metrics, so the two are defined together.
 
+## Cross-cutting: `purchases` field and the portable fit profile
+
+**API:** `Purchase{product_id: str, size: str, fit: dict[str, Literal[five fit words]], verdict: Literal["wear","wear_but_flawed","dont_wear"]}` (`fit`'s keys are whichever dimensions apply to that product's category, SPEC §5's five-word scale). `purchases: list[Purchase]` is silently truncated to the most recent 30 server-side, mirroring `liked`'s cap pattern (no 422 on >30). A purchase whose `product_id` isn't in the artifact's ID map, or whose product is in an unsupported department, is dropped before either the blend or the style profile sees it — never an error. `purchases` is never written to `request_log` or disk anywhere in `serving/`, same enforcement as `liked`.
+
+**Blend (decision 6):** for each dimension, `models/fit/invert.py` turns each surviving purchase's `(garment_cm, ease, fit_word)` into an implied body measurement; if n purchases inform a dimension, the estimate is `n/(n+k) * mean(implied) + k/(n+k) * height_weight_estimate`, k from `config/ranking.yaml`. n=0 → height/weight unchanged.
+
+**Style signal:** each surviving purchase's `verdict` is weighted (`wear: +1.0, wear_but_flawed: 0, dont_wear: -1.0`, same config) and folded into the same weighted-embedding-average style profile as `liked`'s signals, sharing the 3-signal minimum gate.
+
+**Demo page:** `localStorage["acr_purchases_v1"] = [{product_id, size, fit, verdict, ts}]`, capped at 30 (oldest dropped first), managed by `serving/demo/purchases.js`. Sent as `purchases` with every `/search` and `/check-link` call.
+
+## Cross-cutting: `/check-link`
+
+**Resolution:** `serving/api/check_link.py` matches `url`'s host + path against `products.store_domain` + a handle parsed from the URL path (`/products/<handle>`); no match → `{"status": "not_in_catalog", ...}`; a match outside men/unisex → `{"status": "department_unsupported", ...}`; both are HTTP 200 (decision 7).
+
+**Fit and alternatives:** on a match, the linked product's sizes are scored directly (unfiltered) for the best size; similar items reuse `ranking/l1.py` with the linked product's own embedding as the query and the normal `ranking/l2.py` scoring, then keep only candidates with `fit_probability >= linked_fit_probability + check_link_fit_margin` (config, starting 0.05), excluding the linked product, capped at 5 (decision 8).
+
+**Logging:** `request_log` gets an `endpoint` column (migration `0006`) so `/check-link` latency is reportable separately from `/search`, still timings/count only.
+
 ## Cross-cutting: `results/metrics.csv` mechanics
 
-Each phase owns `eval/phaseN_xxx.py` exposing `run(artifact_version) -> list[MetricRow]`, where `MetricRow = {pillar, method, metric, value, ci_low, ci_high, artifact_version, date}`. `eval/run_all.py` imports every phase module, runs them in order (optionally filtered by `--phase`), and upserts rows into `results/metrics.csv` keyed by `(pillar, method, metric, artifact_version)` — same key overwrites, new key appends. `eval/personalization/metrics.py` reads your exported session JSON from `eval/personalization/sessions/` (gitignored — it's your own browsing history) and computes mean top-5 rating before/after with a bootstrap CI, plus click-to-rating agreement, against the stored `w_style=0` baseline run.
+Each phase owns `eval/phaseN_xxx.py` exposing `run(artifact_version) -> list[MetricRow]`, where `MetricRow = {pillar, method, metric, value, ci_low, ci_high, artifact_version, date}`. `eval/run_all.py` imports every phase module, runs them in order (optionally filtered by `--phase`), and upserts rows into `results/metrics.csv` keyed by `(pillar, method, metric, artifact_version)` — same key overwrites, new key appends. `eval/personalization/metrics.py` reads your exported session JSON from `eval/personalization/sessions/` (gitignored — it's your own browsing history) and computes mean top-5 rating before/after with a bootstrap CI, plus click-to-rating agreement, against the stored `w_style=0` baseline run. `eval/phase6_6_purchases.py` and `eval/phase6_6_checklink.py` follow the same `run(artifact_version) -> list[MetricRow]` contract, writing one row per (dimension, k) for the purchases sensitivity and p50/p95 rows for check-link latency.
 
 ## Open items carried from HLD §9 (not blocking, tracked for later phases)
 
 - Initial `ease.yaml` values are placeholders until sanity-checked against the closet set in Phase 3.
 - `w_rel`/`w_fit` tuned on the query set (Phase 4); `w_style` and the signal-weight table finalized from the personalization sessions (Phase 6.5).
 - Final host confirmed against current free-tier limits at Phase 6 — HF Spaces primary, Render fallback (SPEC §4 decision, not actually open).
+- Purchase-correction `k` and the check-link fit margin are starting values (1 and 0.05); Phase 6.6 reports the closet leave-one-out sensitivity across k in {0.5, 1, 2} rather than picking one blindly.

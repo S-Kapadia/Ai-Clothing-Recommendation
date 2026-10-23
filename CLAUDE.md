@@ -20,6 +20,6 @@ Spec: docs/SPEC.md. Architecture: docs/HLD.md. Plan: docs/PLAN.md. Work one phas
 - Every reported metric comes from a script writing results/metrics.csv. No numbers from notebooks.
 - Never generate, edit, or fill in gold-set, closet, classifier spot-check, query, or personalization-session labels. Those are mine.
 - No LLM calls and no PyTorch in serving/. The server uses onnxruntime + NumPy only.
-- No server-side storage of shopper data: height, weight, query text, clicks, ratings and style profiles are never written to the database, request log, or disk. Style profiles are built per request from the `liked` field and discarded.
+- No server-side storage of shopper data: height, weight, query text, purchases, product URLs, clicks, ratings and style profiles are never written to the database, request log, or disk. Style and purchase signals are built per request from the `liked` and `purchases` fields and discarded.
 - Shopper history lives only in browser local storage on the demo page.
 - Each phase ends with its "done when" check from docs/PLAN.md passing, then a commit.

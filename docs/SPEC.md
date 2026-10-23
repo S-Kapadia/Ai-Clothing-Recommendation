@@ -1,6 +1,6 @@
-# Ai-Clothing-Recommendation: SPEC v1.1
+# Ai-Clothing-Recommendation: SPEC v1.2
 
-**Status:** v1.1, 2026-10-21. Architecture lives in `docs/HLD.md`. This spec fixes *what* gets built and *when it is done*. Plan mode decides file-level detail.
+**Status:** v1.2, 2026-10-22. Architecture lives in `docs/HLD.md`. This spec fixes *what* gets built and *when it is done*. Plan mode decides file-level detail.
 
 ## 1. Problem and goal
 
@@ -24,8 +24,10 @@ Size labels are inconsistent across brands: "M" at one brand differs from "M" at
 4. See result cards: photo, brand, item, **size to buy**, overall fit rating, a fit word per measurement, a one-line reason, link to the store.
 5. Items with no fitting size are hidden.
 6. Click a result to open it; the card then asks "How much do you like this? 1 to 5". Clicks and ratings are saved in the browser, and later searches lean toward styles rated highly.
+7. Add owned garments under "My purchases": pick store, product and size from the catalog, give a fit word per measurement and an overall verdict. Saved in the browser; sent with each search and used to correct the body estimate and as a style signal.
+8. Paste a product URL into "Check a link" to get its size, fit and up to 5 better-fitting alternatives from other stores — or a plain message if the store or product isn't in the catalog yet.
 
-No accounts, no tape measure, and nothing about the shopper stored on the server.
+No accounts, no tape measure, and nothing about the shopper — including purchases or pasted URLs — stored on the server.
 
 ## 3. Scope
 
@@ -37,17 +39,21 @@ No accounts, no tape measure, and nothing about the shopper stored on the server
 - Pillar 2: text-only L1 retrieval with category, department and fit filters.
 - Pillar 3: per-measurement fit model and L2 ranking.
 - Style personalization (Phase 6.5): clicks and 1 to 5 ratings stored in the browser, sent with each search, used as a style term in L2.
+- Portable fit profile (Phase 6.6): self-reported purchases correct the body estimate and count as style signals; "check a link" sizes a pasted catalog product URL and suggests better-fitting alternatives.
 - Evaluation harness for every pillar, with baselines.
 - FastAPI search API on free hosting; static demo page; README with the results table.
 
 **Stretch, in priority order**
 1. Local LLM re-rank of the top 20, measured in evaluation (local mode only).
 2. Image embeddings (CLIP) in L1.
-3. Reference-garment input ("I own an M from Brand A"); it also pre-selects department.
-4. Women's fit support: ANSUR female body model, about 20 women's garments of closet data, women's ease values.
-5. Friends' closet data (men's).
-6. Image-only size charts.
-7. Accounts: login, cross-device profile, server-side click and rating history, delete-my-data option.
+3. Women's fit support: ANSUR female body model, about 20 women's garments of closet data, women's ease values.
+4. Friends' closet data (men's).
+5. Image-only size charts.
+6. Accounts: login, cross-device profile, server-side click and rating history, delete-my-data option.
+7. "Check a link" for any Shopify store not in the catalog, fetching /products/<handle>.json live and using the rules parser only (no LLM on the server).
+8. Browser extension that shows the size on the product page itself.
+9. Non-Shopify stores.
+10. Automatic purchase import (order emails or store accounts).
 
 **Non-goals:** accounts in v1, server-side storage of shopper data, women's fit predictions in v1, outerwear or footwear, live catalog refresh, any LLM on the deployed server, real-user traffic.
 
@@ -63,11 +69,13 @@ No accounts, no tape measure, and nothing about the shopper stored on the server
 | Fit labels | Per measurement, five coarse words (section 5) |
 | Body-measurement charts | Converted to garment measurements with a fixed ease per category and dimension |
 | Pants and shorts | Ignore the label number; use chart measurements |
-| Profile input | Height + weight; reference garment is stretch |
+| Profile input | Height + weight, blended per dimension with purchase-implied measurements (weight n/(n+k) toward purchases, n = purchases informing that dimension, k in config); height + weight alone when n = 0 |
 | Closet set | 20 of my own garments now; friends later |
 | Accounts | None in v1; profile, clicks and ratings live in the browser and are sent with each request; accounts are stretch |
 | Personalization | Style profile built per request from clicked and rated products' embeddings; no server-side storage |
 | Rating scale | 1 to 5, asked only after a click |
+| Purchases | Self-reported, browser-only, capped at 30 entries; unknown product IDs ignored; also scored as a style signal |
+| Check a link | Catalog stores only in v1, matched by store domain + product handle; unknown store/product or unsupported department returns a 200 with a status message, not an error |
 | Repo | Convert `AI-Advertisement-Recommendation`, rename to `ai-clothing-recommendation` |
 | Hosting | Hugging Face Spaces (Docker, free CPU), fallback Render; demo page on GitHub Pages |
 | Docker | Local Supabase for development; serving image built and tested locally before deploy. Pipeline and Ollama run natively |
@@ -157,6 +165,20 @@ No accounts, no tape measure, and nothing about the shopper stored on the server
 - Report click-to-rating agreement: share of clicked items rated 4 or 5.
 - Baseline: the same ranking with w_style = 0.
 
+### Portable fit profile (Phase 6.6)
+
+**Purchases.** On the demo page, the shopper adds owned garments under "My purchases": store, product and size picked from the crawled catalog, a fit word per measurement (this section's five-word scale) and an overall verdict (wear / wear but flawed / don't wear — the same three options as the closet set). Stored only in the browser, sent with each request as the optional `purchases` field (section 7), capped at 30 entries; unknown product IDs are ignored.
+
+**Body-estimate correction.** For each dimension, each surviving purchase that reports a fit word on a known garment measurement implies a body measurement, by inverting the same fit-word thresholds the fit model uses. When n purchases inform a dimension, the body estimate for that dimension is a weighted average of the mean purchase-implied value and the height + weight (ANSUR) estimate, with weight n / (n + k) on the purchase-implied value; k is a config value (`config/ranking.yaml`, starting k = 1, so one purchase weighs 50/50 against height + weight, two purchases 2:1, and so on). With zero purchases on a dimension (n = 0), the height + weight estimate is used unchanged. This replaces stretch item "reference-garment input" from v1.1; it is now in v1.
+
+**Purchases as style signal.** Each surviving purchase's verdict feeds the same per-request style profile as `liked` (style personalization, above): `wear` = +1.0, `wear but flawed` = 0, `don't wear` = -1.0 (starting values, config, tuned alongside the rating weights).
+
+**Check a link.** `POST /check-link` (section 7) takes a product URL plus the same profile fields as `/search`. The URL is matched to a catalog product by store domain and product handle; only stores in the crawled catalog are supported in v1. An unmatched store or product, or a product in an unsupported department (women's), returns a plain "not in our catalog yet" / "not supported yet" status — an ordinary 200 response, not an error. On a match: the linked product's best size, fit probability and fit word per measurement are computed and returned unfiltered, even if no size fits well — the shopper already has this product in mind, unlike `/search`, which hides non-fitting items. Up to 5 similar items from other stores that fit better are found by L1 retrieval using the product's own embedding as the query, then the normal L2 ranking, kept only if their fit probability is at least a margin above the linked product's own best-size fit probability (margin in config, starting 0.05), excluding the linked product itself.
+
+**Acceptance**
+- Purchases: leave-one-out on the closet set, where the other closet items act as the shopper's purchases. Report per-dimension fit accuracy (exact word and within one step) with purchases blended in vs. height + weight only, with confidence intervals, for k in {0.5, 1, 2} — the closet set is small, so this is reported as a sensitivity check across k, not a single tuned value.
+- Check a link: tests covering a crawled product URL, an unknown store, an unknown product on a known store, and a known product in an unsupported department. End-to-end latency reported from `request_log` (section 7).
+
 ## 6. Data and labelling
 
 | Dataset | Source | Owner | Due |
@@ -172,6 +194,8 @@ No accounts, no tape measure, and nothing about the shopper stored on the server
 
 **Closet record per garment:** brand, item, size label, category, flat measurements (doubled where half), fit word per measurement, overall verdict (wear / wear but flawed / don't wear).
 
+Phase 6.6 reuses this closet set for its leave-one-out evaluation and reuses the crawled catalog for the check-a-link tests; it needs no new hand-labelled dataset.
+
 ## 7. API contract
 
 `POST /search`
@@ -180,10 +204,13 @@ No accounts, no tape measure, and nothing about the shopper stored on the server
 {"height_cm": 188, "weight_kg": 72, "query": "black chinos",
  "department": "men", "category": "pants", "k": 10,
  "liked": [{"product_id": "123", "signal": "rating", "value": 5},
-           {"product_id": "456", "signal": "click"}]}
+           {"product_id": "456", "signal": "click"}],
+ "purchases": [{"product_id": "789", "size": "32x34",
+                "fit": {"waist": "just right", "inseam": "a bit short"},
+                "verdict": "wear"}]}
 ```
 
-`department` defaults to `men`; `women` returns an empty result with a "coming soon" message in v1. `category` is optional. `liked` is optional, capped at 50 entries; unknown product IDs are ignored.
+`department` defaults to `men`; `women` returns an empty result with a "coming soon" message in v1. `category` is optional. `liked` is optional, capped at 50 entries; unknown product IDs are ignored. `purchases` is optional, capped at 30 entries; unknown product IDs are ignored. Each purchase's fit words correct the body estimate (section 5) and its verdict feeds the style profile alongside `liked`.
 
 Response:
 
@@ -198,9 +225,32 @@ Response:
  "timings_ms": {"profile": 2, "l1": 40, "l2": 15, "style": 3, "total": 63}}
 ```
 
+`POST /check-link`
+
+```json
+{"url": "https://store.example.com/products/slim-chino",
+ "height_cm": 188, "weight_kg": 72,
+ "liked": [], "purchases": []}
+```
+
+Response, when the URL matches a catalog product in a supported department:
+
+```json
+{"status": "ok", "catalog_snapshot": "2026-10-22", "artifact_version": "v1",
+ "product": {"product_id": "789", "title": "...", "brand": "...", "store": "store.example.com",
+   "size": "32x34", "fit_probability": 0.74,
+   "fit": {"waist": "just right", "inseam": "a bit short"},
+   "reason": "Get the 32x34: waist just right. Runs a bit short in the inseam."},
+ "similar": [{"product_id": "...", "title": "...", "brand": "...", "store": "...",
+   "size": "...", "fit_probability": 0.88, "fit": {"...": "..."}, "reason": "..."}],
+ "timings_ms": {"profile": 2, "resolve": 5, "l1": 35, "l2": 12, "total": 54}}
+```
+
+`status` is `"not_in_catalog"` when the store or product isn't in the crawled catalog, or `"department_unsupported"` for a known women's product (the same case `/search`'s `department=women` covers) — both are ordinary 200 responses with a `message` field, never an error. `similar` holds up to 5 items whose `fit_probability` is at least `check_link_fit_margin` (config, starting 0.05) above the linked product's own best-size `fit_probability`, excluding the linked product itself.
+
 `GET /health` returns status, artifact version and catalog snapshot date.
 
-The request log stores timings and result counts only, never height, weight, query text, clicks or ratings. CORS is limited to the demo page origin.
+The request log stores timings, endpoint and result counts only, never height, weight, query text, URLs, purchases, clicks or ratings. CORS is limited to the demo page origin.
 
 ## 8. Demo page
 
@@ -213,9 +263,13 @@ One static page: height and weight inputs (saved to browser local storage), Men 
 - "Clear my history" button.
 - "Export my history" button (JSON download), used for the personalization evaluation.
 
+**Portable fit profile controls:**
+- "My purchases" list: add a purchase by picking store, product and size from the catalog, then a fit word per measurement and an overall verdict; remove any purchase. Kept in local storage, capped at 30, sent with each search and check-a-link.
+- "Check a link" box: paste a product URL, see its size, fit and up to 5 better-fitting alternatives, or a plain message if the store or product isn't supported yet.
+
 ## 9. Evaluation
 
-One command (for example `python -m eval.run_all`) regenerates `results/metrics.csv` with columns: pillar, method, metric, value, ci_low, ci_high, artifact_version, date. Every README number comes from this file, including the personalization metrics computed from the exported session JSON. A new version ships only if no metric drops.
+One command (for example `python -m eval.run_all`) regenerates `results/metrics.csv` with columns: pillar, method, metric, value, ci_low, ci_high, artifact_version, date. Every README number comes from this file, including the personalization metrics computed from the exported session JSON. Phase 6.6 adds the purchases-blend sensitivity (k in {0.5, 1, 2}) and check-link latency to the same file. A new version ships only if no metric drops.
 
 ## 10. Non-functional requirements (detail in HLD)
 
@@ -236,7 +290,7 @@ results/       metrics.csv
 supabase/      migrations/
 ```
 
-## 12. Phases and timeline (ML ships Nov 2)
+## 12. Phases and timeline (ML ships Nov 4)
 
 | Phase | Dates | Builds | Done when |
 | --- | --- | --- | --- |
@@ -248,9 +302,10 @@ supabase/      migrations/
 | 5 | Oct 29 | `run_all` evaluation, artifact bundle | One command regenerates every metric |
 | 6 | Oct 30 | API, demo page, serving image tested locally in Docker, deploy | Local container and live demo both return results |
 | 6.5 | Oct 31 to Nov 1 | Style personalization: `liked` input, style profile, L2 style term, rating prompt, clear and export buttons | Personalization metrics in `results/metrics.csv` vs w_style = 0 |
-| 7 | Nov 2 | README, buffer | Results table and diagram published |
+| 6.6 | Nov 2 to Nov 3 | Portable fit profile: `purchases` input, body-estimate blend, purchases as a style signal, `/check-link` endpoint, demo page controls | Purchases leave-one-out accuracy (k sensitivity) and check-link latency in `results/metrics.csv` |
+| 7 | Nov 4 | README, buffer | Results table and diagram published |
 
-Evaluation is built inside each phase, not saved for the end. If the timeline slips, cut the query set to 30 first; if it slips further, Phase 6.5 moves to stretch without affecting phases 0 to 6.
+Evaluation is built inside each phase, not saved for the end. If the timeline slips: cut the query set to 30 first, then move Phase 6.6 to stretch, then Phase 6.5 to stretch. Phases 0 to 6 must not be affected.
 
 ## 13. My tasks (not Claude Code's)
 
@@ -261,6 +316,7 @@ Evaluation is built inside each phase, not saved for the end. If the timeline sl
 - [ ] Measure 20 garments + my body (by Oct 25)
 - [ ] Write and label 50 queries (by Oct 28)
 - [ ] Run personalization sessions: 10 fixed queries before, 20 or more ratings, same queries after; export history (by Nov 1)
+- [ ] Enter my own purchases on the demo page (Nov 2 to 3)
 - [ ] Review every migration and push it to the hosted DB
 - [ ] Check git history for secrets before making the repo public
 
@@ -268,4 +324,6 @@ Evaluation is built inside each phase, not saved for the end. If the timeline sl
 
 - Initial ease values per category and dimension (config; sanity-checked against the closet set).
 - L2 weights: w_rel and w_fit tuned on the query set; w_style and the signal weights set from the personalization sessions.
+- Purchase-correction k (`config/ranking.yaml`): starting 1, reported for {0.5, 1, 2} against the closet set, since the closet set is too small to trust a single tuned value.
+- Check-link "fits better" margin (config): starting 0.05 fit-probability points.
 - Final host after checking current free-tier limits.
