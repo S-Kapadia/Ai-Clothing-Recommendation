@@ -5,7 +5,7 @@ Scope and acceptance criteria: `docs/SPEC.md`. Architecture: `docs/HLD.md`. This
 **Decisions made while planning (not in SPEC/HLD, recorded here so they aren't re-litigated):**
 
 1. **Label-timing mismatch.** Phase 1's done-when needs classifier spot-check accuracy, but those labels are due Oct 24, two days after Phase 1 ends (Oct 22); Phase 4 has the same pattern (query labels due Oct 28, the same day the phase ends). Every phase with this pattern gets two checkboxes: **pipeline done** (code runs end-to-end on whatever data/labels exist) and **metric reported** (ticks once labels land and `eval/run_all.py --phase N` is rerun).
-2. **Women's data and your partner.** Your partner is building the women's fit model independently, on their own laptop, against the **same local Supabase (Docker) instance** on your machine — not a separate crawl, not a snapshot export. Each of you runs your own fit model filtered by department (yours: men+unisex; theirs: women+unisex). Phase 2's chart normalizer therefore runs over **all departments** (it's per-chart, not per-department, so this is free). Phase 0 adds a read-only Postgres role scoped to the catalog tables for their connection. Exposing local Supabase on the LAN and sharing the read-only connection string is **your** manual task, not something the pipeline automates.
+2. **Women's data and your partner.** Your partner is building the women's fit model independently. They contribute only minor changes through the GitHub repo and run their own local Supabase instance from the same migrations — no shared database, no network exposure, no dedicated database role. Each of you runs your own fit model filtered by department (yours: men+unisex; theirs: women+unisex). Phase 2's chart normalizer still runs over **all departments** (it's per-chart, not per-department, so this is free and keeps the catalog complete either way).
 3. **No integration hooks for women's fit in this repo.** Phase 3's fit model stays hardcoded to the male ANSUR subset, men+unisex, per SPEC. No department-pluggable abstraction is added speculatively — merging your partner's model later is unplanned future work.
 4. **Image-only size charts** auto-abstain in v1 (no vision-LLM call) — stretch goal #6 stays out of scope.
 5. **Demo-page JS tests:** a couple of `node:test` unit tests for the pure history-logic functions (cap-at-50, clear, export shape) plus a manual in-browser QA checklist. No Playwright infra for a single static page.
@@ -33,12 +33,11 @@ Scope and acceptance criteria: `docs/SPEC.md`. Architecture: `docs/HLD.md`. This
 
 **Supabase migrations:**
 - `0001_init.sql` — all core tables (HLD §5): `stores`, `products`, `variants`, `size_charts`, `chart_measurements`, `variant_measurements` (view), `extraction_runs`, `gold_labels`, `closet_items`, `request_log`.
-- `0002_partner_readonly_role.sql` — `partner_ro` role, `SELECT` only on `products`, `variants`, `size_charts`, `chart_measurements`, `variant_measurements` (never `closet_items`/`gold_labels`/`extraction_runs` — those stay yours).
 
 **Config files:** none yet.
 
 **Tests / done when:**
-- [ ] `supabase start` succeeds; `supabase db reset` applies both migrations cleanly; `pytest -q` runs (smoke test importing every package).
+- [ ] `supabase start` succeeds; `supabase db reset` applies the migration cleanly; `pytest -q` runs (smoke test importing every package).
 - Command: `supabase start && supabase db reset && pytest -q`
 
 **Manual tasks required (SPEC §13):** confirm GPU + run one 7B model in Ollama; install Docker Desktop (WSL2). Both due Oct 21, both block everything downstream.

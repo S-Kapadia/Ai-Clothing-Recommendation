@@ -4,3 +4,20 @@ __pycache__
 venv
 
 .env
+
+.venv/
+__pycache__/
+eval/personalization/sessions/
+
+data/*
+!data/.gitkeep
+!data/raw/
+data/raw/*
+!data/raw/.gitkeep
+!data/interim/
+data/interim/*
+!data/interim/.gitkeep
+
+artifacts/*
+!artifacts/.gitkeep
+
