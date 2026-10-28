@@ -1,426 +1,463 @@
-# Ai-Clothing-Recommendation: PLAN v1.1
+# Ai-Clothing-Recommendation: Learning Plan
 
-Scope and acceptance criteria: `docs/SPEC.md`. Architecture: `docs/HLD.md`. This file is the phase-by-phase build checklist — work one phase at a time (CLAUDE.md), tick a box, commit, move on.
+Replaces the Claude-Code-executes-it framing in `docs/DESIGN.md` §11. You write all
+implementation code yourself; this is the roadmap you work through, not a build script.
 
-**Decisions made while planning (not in SPEC/HLD, recorded here so they aren't re-litigated):**
+## How to use this plan
 
-1. **Label-timing mismatch.** Phase 1's done-when needs classifier spot-check accuracy, but those labels are due Oct 24, two days after Phase 1 ends (Oct 22); Phase 4 has the same pattern (query labels due Oct 28, the same day the phase ends). Every phase with this pattern gets two checkboxes: **pipeline done** (code runs end-to-end on whatever data/labels exist) and **metric reported** (ticks once labels land and `eval/run_all.py --phase N` is rerun).
-2. **Women's data and your partner.** Your partner is building the women's fit model independently. They contribute only minor changes through the GitHub repo and run their own local Supabase instance from the same migrations — no shared database, no network exposure, no dedicated database role. Each of you runs your own fit model filtered by department (yours: men+unisex; theirs: women+unisex). Phase 2's chart normalizer still runs over **all departments** (it's per-chart, not per-department, so this is free and keeps the catalog complete either way).
-3. **No integration hooks for women's fit in this repo.** Phase 3's fit model stays hardcoded to the male ANSUR subset, men+unisex, per SPEC. No department-pluggable abstraction is added speculatively — merging your partner's model later is unplanned future work.
-4. **Image-only size charts** auto-abstain in v1 (no vision-LLM call) — stretch goal #6 stays out of scope.
-5. **Demo-page JS tests:** a couple of `node:test` unit tests for the pure history-logic functions (cap-at-50, clear, export shape) plus a manual in-browser QA checklist. No Playwright infra for a single static page.
-6. **Purchase correction is blended, not an override.** Per dimension, the body estimate is `n/(n+k) * purchase_implied + k/(n+k) * height_weight_estimate`, where n = purchases informing that dimension; height + weight alone at n = 0. k lives in `config/ranking.yaml`, starting 1; Phase 6.6 reports the closet leave-one-out accuracy for k in {0.5, 1, 2} since the closet set is too small to trust a single tuned value.
-7. **Check-link and purchase lookups never 4xx on an expected miss.** Not-in-catalog and department-unsupported are both ordinary HTTP 200 responses with a `status` field — consistent with how `/search` already handles `department=women`.
-8. **"Fits better" is a margin, not just "higher."** A check-link similar item must beat the linked product's own best-size `fit_probability` by at least a margin (config, starting 0.05), not merely tie or edge it out — avoids surfacing near-identical alternatives as if they were meaningfully better.
+The working model is defined in `CLAUDE.md` — read it first, it's the source of truth and
+isn't restated here. In short: concepts before code, you write the implementation, ask for
+hints in levels (concept → approach → pseudocode) when stuck, and bring code for review
+before ticking a phase's "done when". Boilerplate (Dockerfiles, CI YAML, config) only gets
+written for you on request, with every line explained.
 
----
+Each phase section below has: **concepts** to learn first, **resources** (official docs
+preferred, at most two per concept), **tasks** as 1–3 hour checkboxes, the **done when**
+check from `docs/DESIGN.md` §11 plus the command that proves it, and project-specific
+**pitfalls**.
 
-## Phase 0 — Oct 21: repo scaffold, local Supabase, migrations
+## Milestones and cut line
 
-**Goal:** stand up the repo skeleton and a working local Supabase so every later phase has somewhere to write code and data.
-
-**Files/modules:**
-- `config/` (empty, populated per-phase)
-- `pipeline/{crawl,classify,charts,normalize,variants}/__init__.py`
-- `models/{body,fit,embed,style}/__init__.py`
-- `serving/{api,demo}/__init__.py`
-- `eval/{gold,closet,queries,personalization}/`, `eval/run_all.py` (stub)
-- `data/{raw,interim}/.gitkeep`, `artifacts/.gitkeep`
-- `results/metrics.csv` (header row only: `pillar,method,metric,value,ci_low,ci_high,artifact_version,date`)
-- `requirements-offline.txt`, `requirements-serving.txt`
-- `pytest.ini` / `conftest.py`
-- `.gitignore` additions: `data/`, `artifacts/`, `.venv/`, `__pycache__/`, `eval/personalization/sessions/`
-
-**Supabase migrations:**
-- `0001_init.sql` — all core tables (HLD §5): `stores`, `products`, `variants`, `size_charts`, `chart_measurements`, `variant_measurements` (view), `extraction_runs`, `gold_labels`, `closet_items`, `request_log`.
-
-**Config files:** none yet.
-
-**Tests / done when:**
-- [ ] `supabase start` succeeds; `supabase db reset` applies the migration cleanly; `pytest -q` runs (smoke test importing every package).
-- Command: `supabase start && supabase db reset && pytest -q`
-
-**Manual tasks required (SPEC §13):** confirm GPU + run one 7B model in Ollama; install Docker Desktop (WSL2). Both due Oct 21, both block everything downstream.
-
-**Risks / fallback:** Supabase CLI/Docker networking issues on Windows+WSL2 → disable unused local services in `supabase/config.toml` (`analytics`, `edge_runtime`) to cut container weight if resources are tight.
+- **Milestone A — thin end-to-end (target: Nov 3).** One brand, rules-based charts, the
+  body + fit model, simple search, one web page. Goal: something real works, start to finish,
+  before deepening anything.
+- **Milestone B — deepening (target: Nov 11, priority order):**
+  1. Ollama normalization
+  2. Auth
+  3. H&M style model
+  4. Learned ranker
+  5. CI/CD + deploy
+- **Cut line.** Anything not finished by Nov 11 moves to Stretch below. Nothing already
+  working gets broken to make room for something new.
 
 ---
 
-## Phase 1 — Oct 22: store vetting, crawler, category + department classifier
+## Milestone A — Thin end-to-end
 
-**Goal:** get a crawled, classified catalog (all departments) into local Supabase.
+### Phase 0 — Scaffold + database
 
-**Files/modules:**
-- `pipeline/crawl/{vet_stores.py, crawler.py, rate_limiter.py}`
-- `pipeline/classify/{rules.py, llm_classifier.py, run.py}`
-- `config/stores.yaml`, `config/classifier_rules.yaml`
+**Concepts**
+- Migrations as versioned, repeatable schema changes — why not just edit tables by hand.
+- Postgres row-level security (RLS): policies are predicates evaluated per row, enforced
+  regardless of which client is asking.
+- What `supabase start` actually boots (Postgres, GoTrue auth, PostgREST, Studio) via Docker.
+- pytest fixtures and test discovery.
+- Docker Compose: service definitions vs image builds.
 
-**Supabase migrations:** none expected; add `0003_classification_fields.sql` (`classified_by`, `confidence` columns on `products`) only if implementation needs fields beyond HLD's schema.
+**Resources**
+- Supabase CLI local development docs (official).
+- Postgres "Row Security Policies" docs (official).
+- pytest "Fixtures" docs (official).
 
-**Config files:**
-- `stores.yaml` — candidate store domains + vetting status/notes (populated as stores are vetted).
-- `classifier_rules.yaml` — category keywords by `product_type`/`tags`/`title`; department keywords; unisex default when no men/women signal is found.
+**Tasks**
+- [ ] Verify `supabase/config.toml`'s linked project ref is correct; run `supabase init` only if needed.
+- [ ] Write migration `0001` — core catalog tables (brands, products, variants, size_charts,
+  chart_measurements, variant_measurements) per `docs/DESIGN.md` §4.
+- [ ] Write migration `0002` — accounts/style tables (profiles, owned_items,
+  style_preferences, extraction_runs, gold_labels, query_labels, request_log) with the RLS
+  policies from §4.
+- [ ] Set up `conftest.py` with a fixture that connects to local Supabase and resets state
+  between tests.
+- [ ] Write one smoke test asserting the schema exists and one asserting an RLS policy
+  actually blocks a cross-user read.
+- [ ] Write a minimal `docker-compose.yml` with `web` and `api` stubs (placeholder containers
+  are fine here — real builds are Milestone B's job).
 
-**Tests / done when:**
-- [ ] **Pipeline done:** `pytest pipeline/crawl pipeline/classify -q` passes (rate limiter enforces 1 req/s, robots.txt respected, rules classifier correct on fixtures); `python -m pipeline.crawl.crawler --snapshot <date>` then `python -m pipeline.classify.run` populate 15–20 stores with every product classified (category + department).
-- [ ] **Metric reported:** once the 50-product spot-check labels exist (due Oct 24), `python -m eval.run_all --phase 1` writes classifier accuracy to `results/metrics.csv`.
+**Done when:** `supabase start`, migrations 0001 and 0002 apply, `pytest` passes, Docker
+Compose starts `web` and `api`.
+Command: `supabase start && supabase db reset && pytest && docker compose up -d web api && docker compose ps`
 
-**Manual tasks (SPEC §13):** shortlist stores (Oct 22 — crawl starts against whatever's shortlisted first); label the 50-product classifier spot check (Oct 24, feeds the metric checkbox above).
+**Pitfalls**
+- Docker Desktop must already be running before `supabase start`, or you get a confusing
+  timeout instead of a clear "docker not found".
+- RLS blocks your own scripts too unless they use the service-role key — don't "fix" this by
+  disabling RLS.
+- Migrations apply in filename order; a typo in the numeric prefix silently reorders them.
+- `supabase db reset` wipes local data every time — never point it anywhere but local.
 
-**Risks / fallback:** a store blocks crawling or hides its chart behind a third-party app → vetting script flags it, swap the store. Spot-check labels landing after Phase 1's nominal end is expected (decision 1) — tracked, not a blocker.
+### Phase 1 — Crawl + classify (one brand)
+
+**Concepts**
+- robots.txt and crawl politeness (rate limits, identifying user agent) — why it matters even
+  for public pages.
+- API-first collection: check for a Shopify `/products.json` endpoint before scraping HTML.
+- Category/department classification as a simple text-classification problem.
+- Why you spot-check 50 random products rather than eyeballing everything.
+
+**Resources**
+- Shopify Storefront/`products.json` conventions (official Shopify dev docs).
+- Python `requests` — a plain `time.sleep`-based throttle is enough; no special library needed.
+
+**Tasks**
+- [ ] Pick one Shopify store with a public catalog to start (the partner's shortlist can wait).
+- [ ] Confirm `/products.json` is exposed and check `robots.txt`.
+- [ ] Write a crawler paginating `/products.json` at ≤1 req/sec with a descriptive User-Agent,
+  writing raw JSON to `data/raw/`.
+- [ ] Write a rules-based classifier mapping each product to category + department
+  (title/tag keyword matching to start).
+- [ ] Sample 50 products, label them yourself, and write a script reporting accuracy to
+  `results/metrics.csv`.
+
+**Done when (partial — full check needs 5 brands, see Milestone B §B.0):** category and
+department accuracy on the 50-product spot check reported, for this one brand.
+Command: `python -m pipeline.crawl.run --brand <slug> && python -m pipeline.classify.spot_check --brand <slug>`
+
+**Pitfalls**
+- Shopify stores vary (some disable `/products.json`, pagination differs) — don't assume this
+  brand's shape generalizes until brand 2 in Milestone B.
+- Rate-limit sleeps belong around every request, not most of them.
+- Don't let unmatched products disappear silently — log and count what the classifier can't categorize.
+
+### Phase 2 — Charts + attributes (rules-based)
+
+**Concepts**
+- Size chart normalization: mapping brand-specific labels to a common measurement space.
+- Why a rules-based baseline comes before an LLM: it's inspectable, free, and gives you a
+  comparison point later.
+- The 11-attribute vocabulary (category, department, fit_type, colour_family, pattern,
+  fabric, stretch, neckline_collar, sleeve_length, leg_shape, formality).
+
+**Resources**
+- `docs/DESIGN.md` §3 (attribute vocabulary and allowed values) — reread it closely here.
+
+**Tasks**
+- [ ] Write a rules-based size chart parser for this brand's chart → `chart_measurements` rows.
+- [ ] Write rules-based attribute extraction (keyword/regex against title+description+tags)
+  for all 11 attributes.
+- [ ] Run it over every product for this brand; confirm no product is left all-null.
+- [ ] Save raw extraction output to `extraction_runs` — keep the schema identical to what the
+  LLM path will use in Milestone B.
+
+**Done when (partial — gold-set comparison and quantization benchmark are Milestone B §B.1):**
+attributes filled for every product, this brand.
+Command: `python -m pipeline.classify.attributes --brand <slug> --method rules && python -m pipeline.classify.coverage_check --brand <slug>`
+
+**Pitfalls**
+- Rules-based fabric/pattern extraction will have real gaps — don't over-invest; Milestone B
+  replaces/compares against it.
+- A schema mismatch between rules and future LLM extraction runs turns the gold-set
+  comparison into a reconciliation headache.
+
+### Phase 3 — Body + fit models
+
+**Concepts**
+- Ridge regression: the L2 penalty's effect with correlated anthropometric features, and
+  bias-variance tradeoff intuition.
+- ANSUR II as a proxy dataset for general body-measurement correlations.
+- Fit modeling as ease (garment − body) turned into a word ("snug"/"true to size"/"loose")
+  and a probability.
+- Bayesian updating: how a known owned-item fit outcome should sharpen, not replace, a
+  height-only body estimate.
+
+**Resources**
+- scikit-learn Ridge regression docs (official).
+- scikit-learn "Underfitting vs Overfitting" example (official) for the bias-variance intuition.
+
+**Tasks**
+- [ ] Load ANSUR II, pick the target dimensions per `docs/DESIGN.md` §6.1, fit a ridge
+  regression per dimension from height (+ a couple other easy inputs).
+- [ ] Report ANSUR MAE vs a height-only baseline to `results/metrics.csv`.
+- [ ] Implement the ease formula and fit-word bands from §6.2.
+- [ ] Implement the fit probability formula; produce fit words/probabilities for every
+  variant of this brand.
+- [ ] Implement the Bayesian update for when a user has an owned item with a known outcome.
+
+**Done when:** ANSUR MAE vs height-only reported; fit words and probabilities produced for
+every variant.
+Command: `python -m models.body.train && python -m models.fit.evaluate >> results/metrics.csv`
+
+**Pitfalls**
+- ANSUR II has separate male/female population files — decide which you're using and say so
+  in the README; don't silently merge them.
+- A good ANSUR held-out MAE doesn't guarantee a good proxy for real shoppers — treat it as a
+  sanity check, not a guarantee.
+- Watch for cm/inch mismatches between ANSUR and your size charts — the likeliest silent bug here.
+
+### Phase 5 (partial) — Simple search
+
+**Concepts**
+- What a MiniLM sentence embedding captures that keyword search doesn't.
+- FAISS as approximate nearest-neighbor search, and why it scales where brute-force
+  similarity doesn't.
+- Why "simple search" here means retrieval only — no learned re-ranking yet.
+
+**Resources**
+- sentence-transformers (MiniLM) official docs.
+- FAISS official wiki, "Getting started".
+
+**Tasks**
+- [ ] Generate MiniLM embeddings for every product (title + description + attributes), this brand.
+- [ ] Build a FAISS index over those embeddings.
+- [ ] Write a search function: embed the query, retrieve top-K, return ranked by raw similarity.
+- [ ] If you build a feed at this stage, order it by **fit probability only** — there is no
+  popularity data for these brands, and the style model doesn't exist yet.
+
+**Done when (partial — NDCG@10 vs BM25 and feed/translation/brand-report are Milestone B
+§B.4):** simple search returns relevant-looking results for hand-tried queries on this brand.
+
+**Pitfalls**
+- Don't reach for the LightGBM ranker yet, even if retrieval quality feels mediocre — that's
+  deferred to Milestone B priority #4.
+- A fit-probability-only feed will look odd (ranking a stylish-but-ill-fitting item last) —
+  that's expected, not a bug to patch with an ad hoc style heuristic.
+
+### Phase 6 (partial) — Simple API, no auth
+
+**Concepts**
+- FastAPI basics: path/query params, Pydantic models, dependency injection.
+- Why a hardcoded demo persona is a legitimate milestone state, not a shortcut to be ashamed
+  of — it unblocks the rest of the stack while auth waits for Milestone B.
+
+**Resources**
+- FastAPI official tutorial, "First Steps" through "Request Body".
+
+**Tasks**
+- [ ] Stand up a FastAPI app with `/v1/search` calling your Phase 5 search function.
+- [ ] Add a hardcoded demo persona so `/v1/search` returns fit-aware results without real auth.
+- [ ] Write integration tests against local Supabase.
+
+**Done when (partial — full auth/RLS integration tests are Milestone B §B.2):**
+`/v1/search` works end-to-end for the demo persona, with passing tests.
+Command: `pytest tests/integration/test_search.py`
+
+**Pitfalls**
+- Keep the hardcoded persona behind a clearly named flag/fixture so it's easy to remove once
+  B.2 lands — don't let it leak into the real auth code path.
+
+### Phase 7 (partial) — One web page
+
+**Concepts**
+- Minimal Vite+React setup: what the dev server does vs a bundler-only workflow.
+- CORS basics for calling a local API from a dev frontend.
+
+**Resources**
+- Vite official "Getting Started".
+- FastAPI `CORSMiddleware` docs (official).
+
+**Tasks**
+- [ ] Scaffold a Vite+React+TypeScript app with one route: `/search`.
+- [ ] Build a search box + result list calling your FastAPI `/v1/search`.
+- [ ] Confirm it runs locally end-to-end: query in, ranked results with fit words out.
+
+**Done when (partial — CI/deploy is Milestone B §B.5):** the one page runs locally and shows
+real search results end-to-end for the demo persona.
+
+**Pitfalls**
+- Don't add TanStack Query, a generated API client, or routing libraries yet — the full
+  frontend stack in `docs/DESIGN.md` §8 is a Milestone B concern; one page needs none of it.
+
+### Phase 8 (partial) — README v1
+
+**Concepts**
+- A README's job here: let a stranger understand the problem, see it work, and run it, in
+  under five minutes of reading.
+
+**Tasks**
+- [ ] Write README v1: problem statement, a screenshot/gif of the one working page, a simple
+  architecture diagram, a results table (ANSUR MAE, attribute coverage, spot-check accuracy),
+  and how-to-run steps for exactly what exists today.
+
+**Done when:** README v1 exists and someone could follow it to run the thin slice end-to-end locally.
+
+**Pitfalls**
+- Don't describe features that don't exist yet (auth, 5 brands, style model) as if done —
+  update incrementally in Milestone B, not by over-promising now.
 
 ---
 
-## Phase 2 — Oct 23–25: chart locator, rules parser, LLM extract + review, validators, variant mapper
+## Milestone B — Deepening (priority order)
 
-**Goal:** turn every unique size chart (every department) into validated garment measurements in cm.
+### B.0 — Scale to 5 brands (mechanical, do first)
 
-**Files/modules:**
-- `pipeline/charts/{locator.py, fingerprint.py}`
-- `pipeline/normalize/{rules_parser.py, schema_builder.py, llm_extractor.py, llm_reviewer.py, validators.py, ease.py, run.py}`
-- `pipeline/variants/mapper.py`
-- `pipeline/llm/cache.py` (shared LLM cache — design below)
-- `prompts/{chart_extract_v1.md, chart_review_v1.md}`
-- `config/dimensions.yaml`, `config/ease.yaml`
+Not a numbered `docs/DESIGN.md` phase on its own — it's what actually satisfies Phase 1's
+real done-when (5 brands) and unlocks everything else in Milestone B that needs multi-brand
+data (style model, size translation, brand report, NDCG eval).
 
-**Supabase migrations:** `variant_measurements` view ships in `0001_init.sql`; only split into its own migration (`0004_variant_measurements_view.sql`) if its shape wasn't finalized by Phase 0.
+**Tasks**
+- [ ] Get the partner's brand shortlist (or pick 4 more Shopify stores yourself if it isn't
+  ready) and re-run the Phase 1 crawler + classifier on each.
+- [ ] Re-run Phase 2's rules-based extraction on each new brand.
+- [ ] Re-run Phase 3's fit model against each brand's size chart.
 
-**Config files:**
-- `dimensions.yaml` — `tops: [chest, body_length, sleeve, shoulder?]`, `bottoms: [waist, hip, inseam, rise?]` (`?` = include if available, per SPEC §5).
-- `ease.yaml` — fixed cm ease per category × dimension for body-basis → garment conversion. Initial values are placeholders, sanity-checked against the closet set in Phase 3 (open item, below).
+**Done when (completes Phase 1's real done-when):** 5 brands crawled; category and department
+accuracy on the 50-product spot check reported, for all 5.
 
-**Tests / done when:**
-- [ ] **Pipeline done:** unit tests for the rules parser (fixture HTML tables), validators (size ordering, plausible ranges, unit conversion, half-measurement doubling), schema builder (schema matches a product's actual size list), and image-only charts auto-abstaining (decision 4). `pytest pipeline/charts pipeline/normalize pipeline/variants -q`.
-- [ ] **Metric reported:** once the 50 gold charts are labelled (due Oct 24, inside this phase's window), `python -m eval.run_all --phase 2` writes field precision (target ≥90%) and abstain rate vs the rules-only baseline to `results/metrics.csv`.
+**Pitfalls**
+- This is where brand-specific quirks surface (different chart table shapes, different
+  Shopify API variants) — budget real time even though it's "mechanical".
 
-**Manual tasks (SPEC §13):** label 50 gold charts (Oct 24).
+### B.1 — Ollama normalization (priority #1, deepens Phase 2)
 
-**Risks / fallback:** LLM throughput too slow for the unique-chart backlog → rules-first + dedup already minimizes calls; if still tight, widen the abstain threshold rather than iterating on prompts into Phase 3. Women's charts add volume but no new code path (decision 2).
+**Concepts**
+- Structured extraction via a local LLM: why JSON-schema-constrained generation beats
+  free-text parsing.
+- Quantization tradeoffs: what 4-bit buys/costs, and why you benchmark 7B vs 3B rather than
+  assume bigger wins.
+- Caching LLM calls by (model, prompt version, input hash) as a correctness requirement for
+  reproducible metrics, not just a speed optimization.
 
----
+**Resources**
+- Ollama official docs (structured/JSON output mode).
+- qwen2.5 model card on the Ollama library page (7B and 3B variants).
 
-## Phase 3 — Oct 26: body estimator, fit model
+**Tasks**
+- [ ] Set up Ollama with qwen2.5:7b-instruct and the 3B variant, 4-bit, temp 0.
+- [ ] Design the JSON schema and prompt for attribute extraction per `docs/DESIGN.md` §3/§5.
+- [ ] Implement the disk cache keyed by model+prompt_version+input_hash; verify a repeated
+  call never re-hits Ollama.
+- [ ] Run LLM extraction across all 5 brands; save raw outputs to `extraction_runs`.
+- [ ] Run the gold-set precision comparison (LLM vs rules-only) — gold labels already exist,
+  don't regenerate them.
+- [ ] Run the 7B vs 3B benchmark (precision + latency); write both to `results/metrics.csv`.
 
-**Goal:** predict body measurements from height/weight and learn per-dimension fit words from your closet set (men's/unisex only — decision 3).
+**Done when:** gold-set precision vs rules-only and the 7B vs 3B benchmark in
+`results/metrics.csv`; attributes filled for every product across all 5 brands.
+Command: `python -m pipeline.classify.attributes --method llm --all-brands && python -m eval.run_all --suite attributes`
 
-**Files/modules:**
-- `models/body/{train_ansur.py, estimator.py, ansur_mapping.py}`
-- `models/fit/{ordinal_model.py, thresholds_fallback.py, train.py}`
-- `pipeline/import/load_closet.py` (loader only — never generates/fills closet labels, per CLAUDE.md)
-- `config/fit_thresholds.yaml`
+**Pitfalls**
+- A cache key missing the prompt version will silently serve stale extractions after you edit
+  a prompt — verify the key covers everything that affects output.
+- VRAM limits can make the 7B model unusably slow; the benchmark exists to find that out, not
+  to assume the bigger model wins.
 
-**Supabase migrations:** none — `closet_items`/`gold_labels` already exist from Phase 0; this phase only reads/writes rows via the loader, run against your own measured data.
+### B.2 — Auth (priority #2, deepens Phase 6)
 
-**Config files:**
-- `fit_thresholds.yaml` — hand-set cm thresholds per dimension type, used as the fallback model.
-- ANSUR → dimension-name mapping, either its own `ansur_mapping.yaml` or a section of `dimensions.yaml`.
+**Concepts**
+- Supabase magic-link auth and what a Bearer token actually proves to the API.
+- RLS as defense-in-depth: the API should still check resource ownership even though the DB
+  would also block it.
 
-**Tests / done when:**
-- [ ] unit tests for the ANSUR mapping, ordinal model fit on synthetic data, threshold fallback.
-- [ ] `python -m eval.run_all --phase 3` writes ANSUR MAE per dimension (vs height-only baseline) and closet leave-one-out accuracy with confidence intervals (vs fixed-threshold baseline) to `results/metrics.csv`.
+**Resources**
+- Supabase Auth docs, magic link / email OTP (official).
+- FastAPI "Security" tutorial section (official), for a Bearer token dependency.
 
-**Manual tasks (SPEC §13):** measure 20 garments + your body (Oct 25 — one day before this phase, tight; see risks).
+**Tasks**
+- [ ] Wire Supabase magic-link auth into the API (verify Bearer token, extract user id).
+- [ ] Replace the hardcoded demo persona with real profile/owned-items/style-preferences
+  reads, scoped by RLS.
+- [ ] Write integration tests confirming one user cannot read another's profile/owned items.
+- [ ] Keep the demo persona path alongside real auth (it's the recruiter/visitor flow in
+  `docs/DESIGN.md` §1, not leftover scaffolding).
 
-**Risks / fallback:** a 20-garment closet set risks overfitting the ordinal model → keep it few-parameter (already a SPEC constraint); if unstable, ship the fixed-threshold fallback as the model actually used in L2, report the ordinal model's number as experimental only.
+**Done when:** all endpoints pass integration tests, including RLS.
+Command: `pytest tests/integration/ -k auth_or_rls`
 
----
+**Pitfalls**
+- A passing suite that never attempts a cross-user access proves nothing about RLS — write
+  the negative test explicitly.
 
-## Phase 4 — Oct 27–28: embeddings, L1 retrieval with filters, L2 ranking
+### B.3 — H&M style model (priority #3, Phase 4)
 
-**Goal:** retrieve and rank candidates by relevance + fit, with the query encoder exported to a server-safe (no-PyTorch) format.
+**Concepts**
+- Training a style model on H&M's Personalized Fashion dataset, then transferring it to 5
+  much smaller brand catalogs — and why that transfer might not work (flagged as a real risk
+  in `docs/DESIGN.md` §12).
+- Logistic regression vs LightGBM for this signal — when the extra complexity is worth it.
 
-**Files/modules:**
-- `models/embed/{encode.py, build_index.py, export_onnx.py}` (PyTorch/sentence-transformers allowed here — offline only)
-- `ranking/{l1.py, l2.py}` — department-agnostic, onnxruntime + NumPy only, imported by both `eval/` and `serving/api/` so the exact same scoring code is evaluated and served
-- `config/ranking.yaml` — `w_rel`, `w_fit` (real values); `w_style: 0` placeholder; signal-weight table placeholder (both finalized in Phase 6.5)
+**Resources**
+- LightGBM official docs, "Python Quick Start".
+- scikit-learn `LogisticRegression` docs (official), as the baseline to beat.
 
-**Supabase migrations:** none — embeddings/index live in the artifact bundle, not the DB (HLD §5).
+**Tasks**
+- [ ] Prepare the H&M dataset per `docs/DESIGN.md` §6.3; train a logistic regression baseline.
+- [ ] Train the LightGBM version and compare.
+- [ ] Apply the trained model to your 5 brands' catalogs; sanity-check outputs make sense.
+- [ ] Report Recall@12 and MAP@12 vs a popularity baseline (H&M has popularity data, even
+  though your 5 brands don't) to `results/metrics.csv`.
 
-**Config files:** `ranking.yaml` as above.
+**Done when:** Recall@12 and MAP@12 vs popularity reported.
+Command: `python -m models.style.train && python -m eval.run_all --suite style`
 
-**Tests / done when:**
-- [ ] **Pipeline done:** FAISS build/query roundtrip test; L1 filter unit tests (category/department/fit-tolerance dropping); L2 scoring unit tests on fixed inputs; BM25 baseline implemented. `pytest ranking models/embed -q`.
-- [ ] **Metric reported:** once the 50-query set is labelled (due Oct 28, the same day this phase ends — decision 1 pattern), `python -m eval.run_all --phase 4` writes Recall@50 and NDCG@10 vs BM25 to `results/metrics.csv`.
+**Pitfalls**
+- `docs/DESIGN.md` §12 already flags this phase as most likely to run long — if transfer to
+  the 5 brands looks weak, report that honestly rather than chasing it indefinitely.
+- Check H&M's Kaggle license terms before committing any derived artifacts (open question in
+  §12); never commit the raw dataset regardless.
 
-**Manual tasks (SPEC §13):** write and label the 50-query set (Oct 28).
+### B.4 — Learned ranker + feed/translation/brand report (priority #4, deepens Phase 5)
 
-**Risks / fallback:** labels land the same day metrics are due, no buffer to react to a bad score → start writing queries earlier (even unlabelled, to exercise the pipeline), backfill real relevance labels Oct 28 and rerun the same day. If the timeline slips further, SPEC's own fallback is to cut the query set to 30.
+**Concepts**
+- Learning to rank: why LambdaRank optimizes a ranking metric (NDCG) directly instead of
+  treating ranking as plain regression/classification.
+- Feature design for the ranker: the signals (retrieval score, fit probability, style score)
+  in the final score formula from `docs/DESIGN.md` §6.5.
 
----
+**Resources**
+- LightGBM official docs, LambdaRank / ranking objective section.
 
-## Phase 5 — Oct 29: `run_all` evaluation, artifact bundle
+**Tasks**
+- [ ] Build the feature set per §6.5 (retrieval score, fit probability, style score from B.3).
+- [ ] Train the LambdaRank ranker on your existing query label set.
+- [ ] Report NDCG@10 vs a BM25 baseline to `results/metrics.csv`.
+- [ ] Implement the "for you" feed, size translation, and brand fit report using the complete
+  fit+style+ranking stack, across all 5 brands.
+- [ ] Confirm feed/translation/brand-report all work in tests.
 
-**Goal:** one command regenerates every metric, and one versioned bundle is all the server needs.
+**Done when:** NDCG@10 vs BM25 reported; feed, size translation and brand report work in tests.
+Command: `python -m models.ranker.train && python -m eval.run_all --suite ranking && pytest tests/integration/test_feed.py tests/integration/test_translate.py tests/integration/test_brand_report.py`
 
-**Files/modules:**
-- `eval/run_all.py` (orchestrates `eval/phase{1,2,3,4,6_5}_*.py`)
-- `models/bundle.py` (packages ONNX encoder, FAISS index + ID map, body/fit models, measurement tables into `artifacts/vN/`)
-- `config/version.yaml` (artifact version string)
+**Pitfalls**
+- Too few labeled queries is a named risk (§12) — a suspiciously perfect train-set NDCG is a
+  reason to check for leakage, not celebrate.
 
-**Supabase migrations:** none.
+### B.5 — CI/CD + deploy (priority #5, deepens Phase 7)
 
-**Config files:** `version.yaml`, bumped per bundle.
+**Concepts**
+- What CI actually buys you (lint/type/test on every push) beyond running checks locally.
+- Multi-stage Docker builds, and why `serving/` must stay LLM/PyTorch-free (onnxruntime+NumPy
+  only) per `CLAUDE.md`.
+- Static frontend (Vercel) vs containerized API (Hugging Face Spaces) deployment models.
 
-**Tests / done when:**
-- [ ] test that `eval/run_all.py` (no `--phase`) writes all required `(pillar, method, metric, artifact_version)` rows with no gaps; smoke test that instantiates `ranking.l1`/`ranking.l2` against a built `artifacts/vN/` bundle without starting the API.
-- [ ] `python -m eval.run_all` regenerates the full `results/metrics.csv` in one command; `artifacts/v1/` contains all expected files.
+**Resources**
+- GitHub Actions official docs, "Quickstart".
+- Docker official docs, "Multi-stage builds".
 
-**Manual tasks:** none new.
+**Tasks**
+- [ ] Flesh out `docker-compose.yml` for real `web`/`api` builds (this is boilerplate — ask
+  for it per `CLAUDE.md`'s rule, with every line explained).
+- [ ] Write `.github/workflows/ci.yml`: lint, type-check, pytest, integration tests against a
+  local Supabase service container.
+- [ ] Build and run the serving image locally; confirm onnxruntime+NumPy only, no torch, no
+  LLM calls, before deploying.
+- [ ] Deploy the API to Hugging Face Spaces and the frontend to Vercel on merge to main.
+- [ ] Wire up structlog and a `/metrics` endpoint per `docs/DESIGN.md` §9.
 
-**Risks / fallback:** a full `run_all` becomes slow/flaky across pillars → cache intermediate per-pillar outputs so `--phase` reruns are incremental, while the no-argument form still guarantees a full regeneration.
+**Done when:** CI green; live demo works with a persona.
 
----
+**Pitfalls**
+- A stray `import torch` or cached LLM client can slip into `serving/` during refactors — CI
+  should fail loudly on this, not rely on code review to catch it.
+- Free-tier hosting memory limits are a named risk (§12) — check current limits before
+  assuming the deploy fits.
 
-## Phase 6 — Oct 30: API, demo page, serving image, deploy
+### B.6 — README v2 (update, Phase 8 remainder)
 
-**Goal:** a Docker-tested FastAPI server and a static demo page both return real results.
+**Tasks**
+- [ ] Update the README from v1 to reflect Milestone B: 5 brands, auth, style model, learned
+  ranker, CI/CD, deploy link.
+- [ ] Refresh the results table with the final `results/metrics.csv` numbers.
+- [ ] Add the live demo link and a persona walkthrough.
 
-**Files/modules:**
-- `serving/api/{main.py, schemas.py, profile.py, l1.py, l2.py, explain.py, logging.py, health.py}` (`l1.py`/`l2.py` re-export from `ranking/`)
-- `serving/demo/{index.html, app.js, history.js, styles.css}`
-- `Dockerfile` (onnxruntime + NumPy + FastAPI only — no torch, no LLM client)
-- `config/server.yaml` (CORS allowed origin, artifact path)
-
-**Supabase migrations:** none expected (`request_log` already exists); add `0005_request_log_artifact_version.sql` only if `artifact_version` needs its own column.
-
-**Config files:** `server.yaml` as above.
-
-**Tests / done when:**
-- [ ] API contract tests via `httpx`/`TestClient`: `/search` happy path, `/health`, `liked` silently truncated to 50, unknown product IDs ignored (no 400 in either case).
-- [ ] static test grepping `serving/**/*.py` and `requirements-serving.txt` for `torch`/`transformers`/`ollama`/any LLM SDK, asserting none are present.
-- [ ] test asserting the `request_log` insert path only ever touches `(timestamp, step timings, result_count, artifact_version)` columns.
-- [ ] **Local:** `docker build -t ai-clothing-api . && docker run ... && curl /health` returns results.
-- [ ] **Live:** the deployed Hugging Face Space (fallback Render) also returns results — manual/semi-manual, needs your hosting account; I prepare and locally verify the image, you own the actual deploy action.
-
-**Manual tasks:** none new from SPEC §13, but hosting-account/login steps are yours.
-
-**Risks / fallback:** free-host memory limits with the ONNX encoder + FAISS index in memory, cold start >60s → encoder already planned as int8 ONNX; shrink the index to in-scope categories first if memory is tight; Render is the documented fallback host (SPEC §4).
-
----
-
-## Phase 6.5 — Oct 31–Nov 1: style personalization
-
-**Goal:** `liked` clicks/ratings shape L2 ranking via a per-request, never-stored style profile, and the demo page supports the full history lifecycle.
-
-**Files/modules:**
-- `serving/api/style.py` (style profile builder, fleshed out from the Phase 6 stub)
-- `serving/demo/history.js` (store/send/clear/export)
-- `serving/demo/history.test.mjs` (`node:test` unit tests, decision 5)
-- `eval/personalization/{session_schema.py, metrics.py}`
-
-**Supabase migrations:** none — no server-side storage of shopper data, by design.
-
-**Config files:** `ranking.yaml` updated with real `w_style` and the signal-weight table (SPEC §5): `rated5: +1.0, rated4: +0.5, rated3: 0, rated2: -0.5, rated1: -1.0, click: +0.25` — tuned after the personalization sessions.
-
-**Tests / done when:**
-- [ ] unit tests for the style profile builder (weighted average, 3-signal minimum gate, unknown-ID ignore, 50-cap, no double-boost for already-rated items).
-- [ ] `node:test` unit tests for `history.js`'s pure functions (cap-at-50, clear, export shape) plus a short manual in-browser QA checklist.
-- [ ] once your exported session JSON exists (due Nov 1), `python -m eval.run_all --phase 6.5` writes mean top-5 rating before/after with CI, and click-to-rating agreement, to `results/metrics.csv`, vs the `w_style=0` baseline.
-
-**Manual tasks (SPEC §13):** run the 10 fixed queries + rate top 5 each (before); make 20+ more ratings on other searches; rerun the same 10 queries + rate top 5 (after); export history — all by Nov 1.
-
-**Risks / fallback:** only a 2-day window right after the Phase 6 deploy for a lot of manual interaction → SPEC's own fallback already applies: if it slips, Phase 6.5 moves to stretch without affecting Phases 0–6.
-
----
-
-## Phase 6.6 — Nov 2–3: portable fit profile (purchases + check a link)
-
-**Goal:** self-reported purchases correct the body estimate (blended with height/weight, never a full override — decision 6) and double as a style signal; a pasted product URL from a catalog store gets sized directly and compared against better-fitting alternatives.
-
-**Files/modules:**
-- `serving/api/purchases.py` (parse `purchases`, build the per-dimension blended estimate, map verdicts to style-signal weights)
-- `serving/api/check_link.py` (URL → domain + handle resolution, `not_in_catalog`/`department_unsupported` responses, similar-items selection)
-- `models/fit/invert.py` (pure function: garment measurement + ease + fit word → implied body measurement; the inverse of the existing fit-word thresholds; shared by `purchases.py` and `eval/phase6_6_purchases.py`)
-- Modify `serving/api/profile.py` (blend purchase-implied measurements into the height/weight estimate, C12a)
-- Modify `serving/api/style.py` (fold purchase verdicts into the existing style-profile weighted sum, C12f)
-- Modify `serving/api/schemas.py` (`Purchase`, `CheckLinkRequest`, `CheckLinkResponse` models)
-- Modify `serving/api/main.py` (register `POST /check-link`)
-- Modify `serving/api/logging.py` (add `endpoint` to the `request_log` insert)
-- `serving/demo/purchases.js` (add/remove/list purchases, capped at 30, local-storage backed)
-- `serving/demo/checklink.js` (URL box, renders the `/check-link` response or its `status` message)
-- `eval/phase6_6_purchases.py` (closet leave-one-out, k in {0.5, 1, 2})
-- `eval/phase6_6_checklink.py` (the four endpoint test cases + latency)
-
-**Supabase migrations:**
-- `0006_request_log_endpoint.sql` — add a nullable `endpoint` column to `request_log` (still timings/result-count only, never a URL or query).
-
-**Config files:**
-- `config/ranking.yaml` additions: `purchase_correction_k` (starting 1), `check_link_fit_margin` (starting 0.05), purchase verdict → style-signal weights (`wear: 1.0, wear_but_flawed: 0.0, dont_wear: -1.0`).
-
-**Tests / done when:**
-- [ ] unit tests for `models/fit/invert.py` (a garment measurement + fit word round-trips to the same fit word when re-scored by the existing fit model).
-- [ ] unit tests for the blend (n=0 falls back to height/weight exactly; n=1 is a 50/50 average at k=1; n=2 is 2:1; unknown purchase product IDs are ignored and don't count toward n).
-- [ ] unit tests for the style-signal mapping (wear/wear_but_flawed/dont_wear weights; purchases and `liked` combine toward the same 3-signal minimum).
-- [ ] unit tests for the URL resolver's four cases: crawled product URL (match), unknown store, unknown product on a known store, known product in an unsupported department — all HTTP 200.
-- [ ] unit test asserting `check_link.py`'s similar-items filter requires `fit_probability >= linked_fit_probability + margin` and excludes the linked product itself.
-- [ ] **Metric reported:** `python -m eval.run_all --phase 6.6` writes, to `results/metrics.csv`: per-dimension purchases-blended-vs-height/weight-only leave-one-out accuracy with confidence intervals for k in {0.5, 1, 2} (noting the closet set is small), and check-link end-to-end latency (p50/p95) from `request_log`.
-
-**Manual tasks (SPEC §13):** enter my own purchases on the demo page (Nov 2–3) — informal QA; the leave-one-out metric reuses the existing closet labels, no new labelling.
-
-**Risks / fallback:** a 2-day window right after Phase 6.5's own tight window → SPEC's fallback order applies: cut the query set to 30 first, then move Phase 6.6 to stretch, then Phase 6.5, with Phases 0–6 unaffected.
+**Done when:** README reflects the actual final state of the project, with a working live
+demo link.
 
 ---
 
-## Phase 7 — Nov 4: README, buffer
+## Stretch
 
-**Goal:** publish the results and architecture; buffer for overflow.
+Cut line: anything below is what gets deferred if Milestone B isn't fully done by Nov 11 —
+deferring it never breaks what's already built.
 
-**Files/modules:** `README.md` (results table generated from `results/metrics.csv`, architecture diagram, setup instructions); final pass on this file's checkboxes.
-
-**Supabase migrations:** none.
-
-**Config files:** none new.
-
-**Tests / done when:**
-- [ ] `python -m eval.render_readme_table --check` verifies every number in the README's results table matches `results/metrics.csv` exactly (no hand-typed numbers).
-- [ ] results table and diagram published.
-
-**Manual tasks (SPEC §13):** check git history for secrets before making the repo public.
-
-**Risks / fallback:** this day is the buffer — absorbs slippage from earlier phases.
-
----
-
-## Cross-cutting: dependencies (pinned)
-
-**Offline** (`requirements-offline.txt` — pipeline, models, eval; PyTorch and the Ollama client live only here):
-
-```
-polars==1.9.0
-pyarrow==17.0.0
-httpx==0.27.2
-tenacity==9.0.0
-lxml==5.3.0
-beautifulsoup4==4.12.3
-pyyaml==6.0.2
-pydantic==2.9.2
-ollama==0.3.3
-torch==2.5.1
-transformers==4.46.0
-sentence-transformers==3.2.1
-optimum[onnxruntime]==1.23.3
-scikit-learn==1.5.2
-statsmodels==0.14.4
-faiss-cpu==1.9.0
-numpy==2.1.3
-matplotlib==3.9.2
-psycopg[binary]==3.2.3
-python-dotenv==1.0.1
-pytest==8.3.3
-```
-
-**Serving** (`requirements-serving.txt` — API only; enforced by the Phase 6 static-import test — no PyTorch, no LLM):
-
-```
-fastapi==0.115.4
-uvicorn[standard]==0.32.0
-pydantic==2.9.2
-onnxruntime==1.19.2
-numpy==2.1.3
-faiss-cpu==1.9.0
-psycopg[binary]==3.2.3
-python-dotenv==1.0.1
-```
-
-## Cross-cutting: LLM JSON schemas
-
-**Extraction schema**, built per-product by `pipeline/normalize/schema_builder.py:build_extraction_schema(category, size_labels, dimensions_cfg)` from `config/dimensions.yaml` (which dimensions are required for tops vs bottoms) and that product's deduped, ordered variant size labels — every listed size must get a row:
-
-```json
-{
-  "type": "object",
-  "required": ["basis", "sizes"],
-  "properties": {
-    "basis": {"type": "string", "enum": ["garment", "body"]},
-    "sizes": {
-      "type": "array",
-      "minItems": "<N = len(size_labels)>",
-      "maxItems": "<N>",
-      "items": {
-        "type": "object",
-        "required": ["size_label", "<...dims for this category>"],
-        "properties": {
-          "size_label": {"type": "string", "enum": "<ordered size_labels>"},
-          "chest_cm": {"type": ["number", "null"]},
-          "body_length_cm": {"type": ["number", "null"]},
-          "sleeve_cm": {"type": ["number", "null"]},
-          "shoulder_cm": {"type": ["number", "null"]},
-          "waist_cm": {"type": ["number", "null"]},
-          "hip_cm": {"type": ["number", "null"]},
-          "inseam_cm": {"type": ["number", "null"]},
-          "rise_cm": {"type": ["number", "null"]}
-        }
-      }
-    },
-    "notes": {"type": ["string", "null"]}
-  }
-}
-```
-
-**Review schema** (second LLM pass):
-
-```json
-{
-  "type": "object",
-  "required": ["overall_confidence", "issues"],
-  "properties": {
-    "overall_confidence": {"type": "string", "enum": ["high", "medium", "low"]},
-    "issues": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": ["size_label", "dimension", "problem", "severity"],
-        "properties": {
-          "size_label": {"type": "string"},
-          "dimension": {"type": "string"},
-          "problem": {"type": "string", "enum": ["implausible_value", "wrong_unit", "half_measurement_suspected", "basis_mismatch", "size_order_violation", "other"]},
-          "severity": {"type": "string", "enum": ["low", "medium", "high"]},
-          "suggested_value_cm": {"type": ["number", "null"]}
-        }
-      }
-    }
-  }
-}
-```
-
-## Cross-cutting: LLM cache design
-
-- **Key:** `sha256(f"{model}:{prompt_version}:{sha256(json.dumps(input_payload, sort_keys=True))}")`.
-- **Storage:** `data/interim/llm_cache/<model>/<prompt_version>/<hash[:2]>/<hash>.json` (under `data/`, gitignored), containing `{model, prompt_version, input_hash, prompt_text, raw_response, parsed_json, latency_ms, created_at}`.
-- **Lookup order:** check the disk file by key first; on hit, return the parsed result with no Ollama call and no DB write. On miss, call Ollama, write the disk file, and insert one row into `extraction_runs` (local Supabase only) for audit.
-- **Invalidation:** bump the `prompt_version` string in the relevant `prompts/*.md` file whenever the template changes (e.g. `v1` → `v2`). The new version writes to a new directory, so old entries simply stop being reachable — no deletion needed. A `pipeline/llm/cache.py:purge(model=None, prompt_version=None)` utility and a `--no-cache` CLI flag exist for manual cleanup/debugging.
-
-## Cross-cutting: `liked` field and demo-page history
-
-**API:** `LikedItem{product_id: str, signal: Literal["click","rating"], value: int|None}` (`value` required and 1–5 only when `signal=="rating"`). `liked: list[LikedItem]` is silently truncated to the most recent 50 server-side (no 422 on >50 — defensive, since the demo already caps client-side). Unknown `product_id`s (not in the artifact's ID map) are skipped when building the style profile, never raise an error. The style profile only builds once at least 3 valid signals remain after filtering. `height_cm`, `weight_kg`, `query`, and `liked` are never written to `request_log` or disk anywhere in `serving/` — enforced by the Phase 6 test asserting the log-insert code path's column list.
-
-**Demo page:** `localStorage["acr_history_v1"] = {clicks: [{product_id, ts}], ratings: [{product_id, value, ts}]}`. On each search, the most-recent 50 entries (clicks + ratings combined, sorted by `ts` desc) are mapped into the `liked` request shape. "Clear my history" wipes the key. "Export my history" downloads the **full** stored history (not just the capped 50) as `acr_history_<timestamp>.json`; this exact shape is what `eval/personalization/session_schema.py` parses for the Phase 6.5 metrics, so the two are defined together.
-
-## Cross-cutting: `purchases` field and the portable fit profile
-
-**API:** `Purchase{product_id: str, size: str, fit: dict[str, Literal[five fit words]], verdict: Literal["wear","wear_but_flawed","dont_wear"]}` (`fit`'s keys are whichever dimensions apply to that product's category, SPEC §5's five-word scale). `purchases: list[Purchase]` is silently truncated to the most recent 30 server-side, mirroring `liked`'s cap pattern (no 422 on >30). A purchase whose `product_id` isn't in the artifact's ID map, or whose product is in an unsupported department, is dropped before either the blend or the style profile sees it — never an error. `purchases` is never written to `request_log` or disk anywhere in `serving/`, same enforcement as `liked`.
-
-**Blend (decision 6):** for each dimension, `models/fit/invert.py` turns each surviving purchase's `(garment_cm, ease, fit_word)` into an implied body measurement; if n purchases inform a dimension, the estimate is `n/(n+k) * mean(implied) + k/(n+k) * height_weight_estimate`, k from `config/ranking.yaml`. n=0 → height/weight unchanged.
-
-**Style signal:** each surviving purchase's `verdict` is weighted (`wear: +1.0, wear_but_flawed: 0, dont_wear: -1.0`, same config) and folded into the same weighted-embedding-average style profile as `liked`'s signals, sharing the 3-signal minimum gate.
-
-**Demo page:** `localStorage["acr_purchases_v1"] = [{product_id, size, fit, verdict, ts}]`, capped at 30 (oldest dropped first), managed by `serving/demo/purchases.js`. Sent as `purchases` with every `/search` and `/check-link` call.
-
-## Cross-cutting: `/check-link`
-
-**Resolution:** `serving/api/check_link.py` matches `url`'s host + path against `products.store_domain` + a handle parsed from the URL path (`/products/<handle>`); no match → `{"status": "not_in_catalog", ...}`; a match outside men/unisex → `{"status": "department_unsupported", ...}`; both are HTTP 200 (decision 7).
-
-**Fit and alternatives:** on a match, the linked product's sizes are scored directly (unfiltered) for the best size; similar items reuse `ranking/l1.py` with the linked product's own embedding as the query and the normal `ranking/l2.py` scoring, then keep only candidates with `fit_probability >= linked_fit_probability + check_link_fit_margin` (config, starting 0.05), excluding the linked product, capped at 5 (decision 8).
-
-**Logging:** `request_log` gets an `endpoint` column (migration `0006`) so `/check-link` latency is reportable separately from `/search`, still timings/count only.
-
-## Cross-cutting: `results/metrics.csv` mechanics
-
-Each phase owns `eval/phaseN_xxx.py` exposing `run(artifact_version) -> list[MetricRow]`, where `MetricRow = {pillar, method, metric, value, ci_low, ci_high, artifact_version, date}`. `eval/run_all.py` imports every phase module, runs them in order (optionally filtered by `--phase`), and upserts rows into `results/metrics.csv` keyed by `(pillar, method, metric, artifact_version)` — same key overwrites, new key appends. `eval/personalization/metrics.py` reads your exported session JSON from `eval/personalization/sessions/` (gitignored — it's your own browsing history) and computes mean top-5 rating before/after with a bootstrap CI, plus click-to-rating agreement, against the stored `w_style=0` baseline run. `eval/phase6_6_purchases.py` and `eval/phase6_6_checklink.py` follow the same `run(artifact_version) -> list[MetricRow]` contract, writing one row per (dimension, k) for the purchases sensitivity and p50/p95 rows for check-link latency.
-
-## Open items carried from HLD §9 (not blocking, tracked for later phases)
-
-- Initial `ease.yaml` values are placeholders until sanity-checked against the closet set in Phase 3.
-- `w_rel`/`w_fit` tuned on the query set (Phase 4); `w_style` and the signal-weight table finalized from the personalization sessions (Phase 6.5).
-- Final host confirmed against current free-tier limits at Phase 6 — HF Spaces primary, Render fallback (SPEC §4 decision, not actually open).
-- Purchase-correction `k` and the check-link fit margin are starting values (1 and 0.05); Phase 6.6 reports the closet leave-one-out sensitivity across k in {0.5, 1, 2} rather than picking one blindly.
+- Load test (Locust) — p50/p95 latency numbers in `results/metrics.csv` (Phase 8 remainder).
+- ADRs in `docs/adr/` (Phase 8 remainder).
+- Closet set.
+- MCP.
+- Extra quantization configs beyond the 7B/3B benchmark.
+- Partner-owned items not yet delivered: brand shortlist beyond what B.0 needed, ease
+  reference values, H&M menswear exploration, query set draft, the Locust load test itself.
+- `docs/DESIGN.md` §12 open questions, carried over:
+  - [ ] Which 5 brands? (partner shortlist due first)
+  - [ ] Is the attribute vocabulary in §3 final?
+  - [ ] Ease values and thresholds t1, t2 per dimension (partner's reference table)
+  - [ ] Do H&M's Kaggle terms allow use in a public portfolio repo if the data itself is never committed?
+  - [ ] Final hosting tier after checking current limits
