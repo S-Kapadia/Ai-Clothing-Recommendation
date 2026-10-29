@@ -1,14 +1,15 @@
-node_modules
-.env
-__pycache__
-venv
-
+# Secrets
 .env
 
+# Python
 .venv/
+venv/
 __pycache__/
-eval/personalization/sessions/
 
+# Node
+node_modules/
+
+# Data: ignore everything, keep folder placeholders
 data/*
 !data/.gitkeep
 !data/raw/
@@ -17,16 +18,13 @@ data/raw/*
 !data/interim/
 data/interim/*
 !data/interim/.gitkeep
+!data/cache/
+data/cache/*
+!data/cache/.gitkeep
 
+# Model artifacts
 artifacts/*
 !artifacts/.gitkeep
 
-
+# Claude Code personal settings
 .claude/settings.local.json
-
-!data/cache/
-data/cache/*
-!data/cache/.gitkeep
-!data/cache/
-data/cache/*
-!data/cache/.gitkeep
