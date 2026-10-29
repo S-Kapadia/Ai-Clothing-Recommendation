@@ -21,3 +21,5 @@ data/interim/*
 artifacts/*
 !artifacts/.gitkeep
 
+
+.claude/settings.local.json
