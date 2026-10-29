@@ -23,3 +23,10 @@ artifacts/*
 
 
 .claude/settings.local.json
+
+!data/cache/
+data/cache/*
+!data/cache/.gitkeep
+!data/cache/
+data/cache/*
+!data/cache/.gitkeep
