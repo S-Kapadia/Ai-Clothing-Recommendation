@@ -36,6 +36,18 @@ check from `docs/DESIGN.md` §11 plus the command that proves it, and project-sp
 
 ### Phase 0 — Scaffold + database
 
+**Status (as of 2026-10-30 session)**
+- Done: migrations `0001_catalog.sql` and `0002_accounts.sql` applied; `tests/conftest.py`
+  fixtures; schema smoke test (3 passing: tables exist, `variant_measurements` view
+  exists, RLS enabled + signup trigger exists); `requirements.txt`.
+- Remaining: the cross-user RLS test in `tests/integration/test_rls.py` (in progress —
+  approach: single transaction, admin setup, `SET LOCAL ROLE authenticated` plus
+  `request.jwt.claims` to impersonate each user, a positive control read as user A, a
+  zero-rows read as user B, rollback for cleanup); `docker-compose.yml` stub.
+- Open decision: hosted vs. local Supabase for the deployed app — determines whether
+  `docker-compose.yml` needs its own `db` service or just `web`/`api` against a remote
+  instance.
+
 **Concepts**
 - Migrations as versioned, repeatable schema changes — why not just edit tables by hand.
 - Postgres row-level security (RLS): policies are predicates evaluated per row, enforced
@@ -51,15 +63,17 @@ check from `docs/DESIGN.md` §11 plus the command that proves it, and project-sp
 
 **Tasks**
 - [ ] Verify `supabase/config.toml`'s linked project ref is correct; run `supabase init` only if needed.
-- [ ] Write migration `0001` — core catalog tables (brands, products, variants, size_charts,
+- [x] Write migration `0001` — core catalog tables (brands, products, variants, size_charts,
   chart_measurements, variant_measurements) per `docs/DESIGN.md` §4.
-- [ ] Write migration `0002` — accounts/style tables (profiles, owned_items,
+- [x] Write migration `0002` — accounts/style tables (profiles, owned_items,
   style_preferences, extraction_runs, gold_labels, query_labels, request_log) with the RLS
   policies from §4.
-- [ ] Set up `conftest.py` with a fixture that connects to local Supabase and resets state
+- [x] Set up `conftest.py` with a fixture that connects to local Supabase and resets state
   between tests.
-- [ ] Write one smoke test asserting the schema exists and one asserting an RLS policy
-  actually blocks a cross-user read.
+- [x] Write a smoke test asserting the schema exists (tables, the `variant_measurements`
+  view, RLS enabled, the signup trigger).
+- [ ] Write a smoke test asserting an RLS policy actually blocks a cross-user read
+  (`tests/integration/test_rls.py`, in progress).
 - [ ] Write a minimal `docker-compose.yml` with `web` and `api` stubs (placeholder containers
   are fine here — real builds are Milestone B's job).
 
